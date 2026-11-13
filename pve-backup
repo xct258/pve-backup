@@ -656,10 +656,10 @@ def save_conf(cfg: dict) -> None:
             path = str(e.get("path", "")).strip().strip("/")
             if not path:
                 continue
-            cp[f"vm:{vmid}:remote:{path}"] = {
-                "keep": str(e.get("keep", "")),
-                "enabled": str(e.get("enabled", "1")),
-            }
+            opts = {"enabled": str(e.get("enabled", "1"))}
+            if str(e.get("keep", "")).strip():
+                opts["keep"] = str(e.get("keep", "")).strip()
+            cp[f"vm:{vmid}:remote:{path}"] = opts
     with open(CONF, "w", encoding="utf-8") as f:
         f.write(f"# 由 {SELF_PATH} 生成 {dt.datetime.now():%Y-%m-%d %H:%M:%S}\n")
         cp.write(f)
@@ -2287,7 +2287,7 @@ def _ui_choice(scr, title, options, default=0):
                 return None
         elif ch in ("k", "j"):
             pos = (pos + (-1 if ch == "k" else 1)) % len(options)
-        elif ch == "\n":
+        elif ch in ("\n", "\r"):
             return pos
         elif ch in ("q", "\x1b"):
             return None
@@ -2342,6 +2342,12 @@ def _ui_input(scr, title, default="", hint=""):
                 pos = 0
             elif ch == curses.KEY_END:
                 pos = len(buf)
+        elif isinstance(ch, str) and ch in ("\n", "\r"):
+            try:
+                curses.curs_set(0)
+            except Exception:
+                pass
+            return buf
         elif isinstance(ch, str) and ch.isprintable():
             buf = buf[:pos] + ch + buf[pos:]
             pos += 1
@@ -2980,7 +2986,7 @@ def _ui_dashboard() -> None:
             if ch in ("j", "k"):
                 sel = _ui_move(rows, sel, 1 if ch == "j" else -1)
                 continue
-            if ch == "\n":
+            if ch in ("\n", "\r"):
                 key = rows[sel]["key"]
                 msg, quit_now = _ui_action(scr, key, _ui_info())
                 if quit_now:
