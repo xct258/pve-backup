@@ -555,7 +555,12 @@ def load_conf() -> dict:
             vmid = head.split(":", 1)[1].strip()
             path = rest.strip().strip("/")
             if vmid and path:
-                cfg["vm_remotes"].setdefault(vmid, []).append(path)
+                d = {k: v for k, v in cp.items(sect)}
+                cfg["vm_remotes"].setdefault(vmid, []).append({
+                    "path": path,
+                    "keep": str(d.get("keep", "")).strip(),
+                    "enabled": str(d.get("enabled", "1")).strip(),
+                })
         elif sect.startswith("vm:"):
             vmid = sect.split(":", 1)[1].strip()
             if vmid:
@@ -643,12 +648,18 @@ def save_conf(cfg: dict) -> None:
     for vmid in sorted(cfg["vms"], key=lambda x: int(x) if x.isdigit() else 0):
         vm = cfg["vms"][vmid]
         cp[f"vm:{vmid}"] = {k: str(v) for k, v in vm.items() if str(v) != ""}
-    for vmid, paths in sorted(cfg.get("vm_remotes", {}).items(),
-                              key=lambda x: int(x[0]) if x[0].isdigit() else 0):
-        for p in paths:
-            p = str(p).strip().strip("/")
-            if p:
-                cp[f"vm:{vmid}:remote:{p}"] = {}
+    for vmid, entries in sorted(cfg.get("vm_remotes", {}).items(),
+                                key=lambda x: int(x[0]) if x[0].isdigit() else 0):
+        for e in entries:
+            if isinstance(e, str):
+                e = {"path": e}
+            path = str(e.get("path", "")).strip().strip("/")
+            if not path:
+                continue
+            cp[f"vm:{vmid}:remote:{path}"] = {
+                "keep": str(e.get("keep", "")),
+                "enabled": str(e.get("enabled", "1")),
+            }
     with open(CONF, "w", encoding="utf-8") as f:
         f.write(f"# 由 {SELF_PATH} 生成 {dt.datetime.now():%Y-%m-%d %H:%M:%S}\n")
         cp.write(f)
@@ -842,10 +853,29 @@ def remote_bases(cfg: dict) -> list:
     return [f"{remote}:{p}/{host}" for p in remote_paths(cfg)]
 
 
+def vm_remote_entries(cfg: dict, vmid, only_enabled: bool = False) -> list:
+    """某台虚拟机自己的云端目录列表（path / keep / enabled）。"""
+    out = []
+    for r in cfg.get("vm_remotes", {}).get(str(vmid), []):
+        if isinstance(r, str):
+            r = {"path": r}
+        path = str(r.get("path", "")).strip().strip("/")
+        if not path:
+            continue
+        entry = {
+            "path": path,
+            "keep": str(r.get("keep", "")).strip(),
+            "enabled": str(r.get("enabled", "1")).strip(),
+        }
+        if only_enabled and entry["enabled"] == "0":
+            continue
+        out.append(entry)
+    return out
+
+
 def vm_remote_paths(cfg: dict, vmid) -> list:
-    """某台虚拟机使用的远端目录；未单独设置时返回全局目录。"""
-    sel = [str(p).strip().strip("/")
-           for p in cfg.get("vm_remotes", {}).get(str(vmid), []) if str(p).strip()]
+    """某台虚拟机使用的云端目录；未单独设置时返回全局目录。"""
+    sel = [e["path"] for e in vm_remote_entries(cfg, vmid, only_enabled=True)]
     return sel or remote_paths(cfg)
 
 
@@ -856,9 +886,17 @@ def vm_remote_bases(cfg: dict, vmid) -> list:
 
 
 def vm_remote_keep(cfg: dict, vmid) -> str:
-    """该虚拟机的云端保留份数；空表示跟随所在目录的设置。"""
+    """虚拟机级别的兜底保留份数（旧配置兼容）；空表示跟随目录。"""
     vm = cfg.get("vms", {}).get(str(vmid), {})
     return str(vm.get("remote_keep", "") or "").strip()
+
+
+def vm_remote_keep_for(cfg: dict, vmid, path: str) -> str:
+    """该 VM 在指定目录下的保留份数：VM 目录项 > VM 级设置 > 空。"""
+    for e in vm_remote_entries(cfg, vmid):
+        if e["path"] == str(path).strip().strip("/") and e["keep"]:
+            return e["keep"]
+    return vm_remote_keep(cfg, vmid)
 
 
 def list_run_dirs(base: str) -> list:
@@ -917,7 +955,7 @@ def enforce_folder_keep(cfg: dict):
                 continue
             drop = True
             for v in owners:
-                keep = vm_remote_keep(cfg, v) or dir_keep
+                keep = vm_remote_keep_for(cfg, v, path) or dir_keep
                 if not str(keep).strip().isdigit() or int(keep) <= 0:
                     drop = False
                     break
@@ -1325,11 +1363,13 @@ def act_config(cfg: dict) -> None:
             if isinstance(val, bool):
                 val = "1" if val else "0"
             print(f"  {pad(k, 18)} {val}")
-        sel = cfg.get("vm_remotes", {}).get(vmid) or []
-        print(f"  {pad('云端目录', 18)} "
-              f"{'、'.join(sel) if sel else '跟随全局'}")
-        print(f"  {pad('云端保留', 18)} "
-              f"{vm_remote_keep(cfg, vmid) or '跟随目录设置'}")
+        entries = vm_remote_entries(cfg, vmid)
+        if not entries:
+            print(f"  {pad('云端目录', 18)} 跟随全局")
+        for e in entries:
+            keep = e["keep"] or vm_remote_keep_for(cfg, vmid, e["path"]) or "跟随目录"
+            state = "" if e["enabled"] != "0" else "（停用）"
+            print(f"  {pad('云端目录', 18)} {e['path']}  保留 {keep}{state}")
 
 
 # ------------------------------------------------------------------ 虚拟机管理
@@ -1550,28 +1590,70 @@ def interactive_vm_menu(cfg: dict) -> None:
 
 
 def edit_vm_remotes_interactive(cfg: dict, vmid: str) -> None:
-    """为单台虚拟机挑选云端备份目录；不选则跟随全局。"""
+    """文本菜单：管理这台虚拟机自己的云端目录（与全局目录管理一致）。"""
     while True:
-        cfg_ref = cfg
-        paths = remote_paths(cfg_ref)
-        sel = [str(x) for x in cfg_ref.get("vm_remotes", {}).get(str(vmid), [])]
-        opts = [f"[{'✓' if p in sel else ' '}] {p}" for p in paths]
-        opts += ["跟随全局（清除自定义）", "返回"]
+        entries = vm_remote_entries(cfg, vmid)
+        opts = []
+        for r in entries:
+            keep = r["keep"] or vm_remote_keep_for(cfg, vmid, r["path"]) or "跟随目录"
+            state = "" if r["enabled"] != "0" else "（停用）"
+            opts.append(f"{r['path']}   保留 {keep}{state}")
+        opts += ["添加云端目录", "跟随全局（清除自定义）", "返回"]
         idx = pick(f"VM {vmid} 云端备份目录", opts)
         if idx is None or idx == len(opts) - 1:
             return
-        if idx == len(paths):
-            cfg_ref.setdefault("vm_remotes", {}).pop(str(vmid), None)
-        else:
-            path = paths[idx]
-            if path in sel:
-                sel.remove(path)
-            else:
-                sel.append(path)
-            if sel:
-                cfg_ref.setdefault("vm_remotes", {})[str(vmid)] = sel
-            else:
-                cfg_ref.setdefault("vm_remotes", {}).pop(str(vmid), None)
+
+        store = cfg.setdefault("vm_remotes", {})
+        if idx == len(entries):
+            try:
+                path = input("目录路径（相对 WebDAV 根）: ").strip().strip("/")
+                if not path:
+                    continue
+                keep = input(f"保留份数（留空跟随目录设置，默认 "
+                             f"{cfg['global'].get('remote_keep') or '不限'}）: ").strip()
+            except (EOFError, KeyboardInterrupt):
+                continue
+            store.setdefault(str(vmid), []).append(
+                {"path": path, "keep": keep, "enabled": "1"})
+            save_conf(cfg)
+            print("已添加")
+            continue
+
+        if idx == len(entries) + 1:
+            store.pop(str(vmid), None)
+            save_conf(cfg)
+            print("已改为跟随全局")
+            continue
+
+        r = entries[idx]
+        target = next((x for x in store.get(str(vmid), [])
+                       if str(x.get("path", "")).strip().strip("/") == r["path"]), None)
+        if target is None:
+            continue
+        act = pick(f"管理 {r['path']}", ["修改路径", "修改保留份数",
+                                         "启用/停用", "删除", "返回"])
+        if act is None or act == 4:
+            continue
+        if act == 0:
+            try:
+                v = input(f"新路径（当前 {r['path']}）: ").strip().strip("/")
+            except (EOFError, KeyboardInterrupt):
+                continue
+            if v:
+                target["path"] = v
+        elif act == 1:
+            try:
+                v = input(f"保留份数（当前 {r['keep'] or '跟随目录'}，0 不清理）: ").strip()
+            except (EOFError, KeyboardInterrupt):
+                continue
+            target["keep"] = v
+        elif act == 2:
+            target["enabled"] = "0" if r["enabled"] != "0" else "1"
+        elif act == 3:
+            if confirm(f"移除云端目录 {r['path']}？（不删已上传文件）", "是，移除", "否，取消"):
+                store[str(vmid)] = [x for x in store.get(str(vmid), []) if x is not target]
+                if not store[str(vmid)]:
+                    store.pop(str(vmid), None)
         save_conf(cfg)
         print("已保存")
 
@@ -1581,10 +1663,9 @@ def edit_vm_interactive(cfg: dict, vmid: str) -> None:
     guests = guest_map()
     while True:
         p = target_params(cfg, vmid, guests)
-        sel = cfg.get("vm_remotes", {}).get(str(vmid)) or []
-        remotes_txt = (f"自定义 {len(sel)} 个" if sel
+        n_rec = len(vm_remote_entries(cfg, vmid))
+        remotes_txt = (f"自定义 {n_rec} 个" if n_rec
                        else f"跟随全局（{len(remote_paths(cfg))} 个）")
-        vkeep = vm_remote_keep(cfg, vmid)
         labels = [
             ("mode", f"备份模式: {p['mode']}"),
             ("compress", f"压缩: {p['compress']}"),
@@ -1592,7 +1673,6 @@ def edit_vm_interactive(cfg: dict, vmid: str) -> None:
             ("delete_local", f"上传后删本地: {p['delete_local']}"),
             ("verify_hash", f"SHA256 校验: {p['verify_hash']}"),
             ("remotes", f"云端备份目录: {remotes_txt}"),
-            ("remote_keep", f"云端保留份数: {vkeep or '跟随目录设置'}"),
             ("enabled", f"启用: {'1' if p['enabled'] else '0'}"),
         ]
         idx = pick(f"修改 VM {vmid}（{p['name'] or '-'}）参数",
@@ -1607,19 +1687,6 @@ def edit_vm_interactive(cfg: dict, vmid: str) -> None:
 
         if key == "remotes":
             edit_vm_remotes_interactive(cfg, vmid)
-            continue
-
-        if key == "remote_keep":
-            try:
-                v = input(f"云端保留份数（当前 {vkeep or '跟随目录设置'}，"
-                          "留空跟随目录，0 不清理）: ").strip()
-            except (EOFError, KeyboardInterrupt):
-                continue
-            if v:
-                vm["remote_keep"] = v
-            else:
-                vm.pop("remote_keep", None)
-            save_conf(cfg)
             continue
 
         if key == "mode":
@@ -2439,46 +2506,94 @@ def _ui_draw_dashboard(scr, rows, sel, msg) -> None:
 
 
 def _ui_vm_remotes(scr, vmid) -> None:
+    """按全局目录管理的方式，编辑这台虚拟机自己的云端目录列表。"""
     while True:
         cfg = load_conf()
-        paths = remote_paths(cfg)
-        sel = [str(x) for x in cfg.get("vm_remotes", {}).get(str(vmid), [])]
-        opts = [f"[{'✓' if p in sel else ' '}] {p}" for p in paths]
-        opts += ["跟随全局（清除自定义）", "返回"]
+        entries = vm_remote_entries(cfg, vmid)
+        opts = []
+        for r in entries:
+            keep = r["keep"] or vm_remote_keep_for(cfg, vmid, r["path"]) or "跟随目录"
+            state = "" if r["enabled"] != "0" else "（停用）"
+            opts.append(f"{pad(r['path'], 28)} 保留 {keep}{state}")
+        opts += ["添加云端目录", "跟随全局（清除自定义）", "返回"]
         idx = _ui_choice(scr, f"VM {vmid} 云端备份目录", opts)
         if idx is None or idx == len(opts) - 1:
             return
-        if idx == len(paths):
-            cfg.setdefault("vm_remotes", {}).pop(str(vmid), None)
+
+        store = cfg.setdefault("vm_remotes", {})
+        if idx == len(entries):
+            have = {r["path"] for r in entries}
+            cand = [p for p in remote_paths(cfg) if p not in have]
+            ci = _ui_choice(scr, "添加云端目录",
+                            cand + ["手动输入路径", "返回"]) if cand else 0
+            if cand:
+                if ci is None or ci == len(cand) + 1:
+                    continue
+            if cand and ci < len(cand):
+                path = cand[ci]
+            else:
+                path = _ui_input(scr, "目录路径", "",
+                                 "相对 WebDAV 根，如 阿里网盘/backup")
+                if not (path and path.strip()):
+                    continue
+                path = path.strip()
+            keep = _ui_input(scr, "保留份数", "",
+                             "留空跟随目录设置，0 表示不清理")
+            store.setdefault(str(vmid), []).append({
+                "path": path.strip().strip("/"),
+                "keep": (keep or "").strip(),
+                "enabled": "1",
+            })
             save_conf(cfg)
             _ui_bust()
             continue
-        path = paths[idx]
-        if path in sel:
-            sel.remove(path)
-        else:
-            sel.append(path)
-        if sel:
-            cfg.setdefault("vm_remotes", {})[str(vmid)] = sel
-        else:
-            cfg.setdefault("vm_remotes", {}).pop(str(vmid), None)
+
+        if idx == len(entries) + 1:
+            store.pop(str(vmid), None)
+            save_conf(cfg)
+            _ui_bust()
+            continue
+
+        r = entries[idx]
+        target = next((x for x in store.get(str(vmid), [])
+                       if str(x.get("path", "")).strip().strip("/") == r["path"]), None)
+        if target is None:
+            continue
+        act = _ui_choice(scr, r["path"], [
+            "修改路径", "修改保留份数", "启用/停用", "删除", "返回"])
+        if act is None or act == 4:
+            continue
+        if act == 0:
+            v = _ui_input(scr, "修改路径", r["path"])
+            if v and v.strip():
+                target["path"] = v.strip().strip("/")
+        elif act == 1:
+            v = _ui_input(scr, "保留份数",
+                          r["keep"] or vm_remote_keep_for(cfg, vmid, r["path"]),
+                          "留空跟随目录设置，0 表示不清理")
+            if v is not None:
+                target["keep"] = v.strip()
+        elif act == 2:
+            target["enabled"] = "0" if r["enabled"] != "0" else "1"
+        elif act == 3:
+            if _ui_confirm(scr, f"移除云端目录 {r['path']}？（不删已上传文件）"):
+                store[str(vmid)] = [x for x in store.get(str(vmid), []) if x is not target]
+                if not store[str(vmid)]:
+                    store.pop(str(vmid), None)
         save_conf(cfg)
         _ui_bust()
 
 
 def _ui_vm_edit(scr, vmid) -> None:
     fields = ["mode", "compress", "local_prune", "delete_local",
-              "verify_hash", "remotes", "remote_keep", "enabled"]
+              "verify_hash", "remotes", "enabled"]
     while True:
         cfg = load_conf()
         guests = guest_map()
         p = target_params(cfg, vmid, guests)
-        sel = cfg.get("vm_remotes", {}).get(str(vmid)) or []
-        if sel:
-            remotes_txt = f"自定义（{len(sel)} 个）"
-        else:
-            remotes_txt = f"跟随全局（{len(remote_paths(cfg))} 个）"
-        vkeep = vm_remote_keep(cfg, vmid)
+        n_rec = len(vm_remote_entries(cfg, vmid))
+        remotes_txt = (f"自定义（{n_rec} 个）" if n_rec
+                       else f"跟随全局（{len(remote_paths(cfg))} 个）")
         opts = [
             f"备份模式        {p['mode']}",
             f"压缩算法        {p['compress']}",
@@ -2486,7 +2601,6 @@ def _ui_vm_edit(scr, vmid) -> None:
             f"上传后删本地    {'是' if p['delete_local'] == '1' else '否'}",
             f"SHA256 校验     {'是' if p['verify_hash'] == '1' else '否'}",
             f"云端备份目录    {remotes_txt}",
-            f"云端保留份数    {vkeep or '跟随目录设置'}",
             f"启用备份        {'是' if p['enabled'] else '否'}",
             "完成并返回",
         ]
@@ -2497,17 +2611,6 @@ def _ui_vm_edit(scr, vmid) -> None:
         vm = cfg["vms"].setdefault(vmid, {"enabled": "1"})
         if key == "remotes":
             _ui_vm_remotes(scr, vmid)
-            continue
-        if key == "remote_keep":
-            v = _ui_input(scr, "云端保留份数", vkeep,
-                          "留空跟随目录设置，0 表示不清理")
-            if v is not None:
-                if v.strip():
-                    vm["remote_keep"] = v.strip()
-                else:
-                    vm.pop("remote_keep", None)
-                save_conf(cfg)
-                _ui_bust()
             continue
         if key == "mode":
             v = _ui_choice(scr, "备份模式", ["snapshot（快照，不停机）",

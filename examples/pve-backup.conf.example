@@ -32,7 +32,11 @@ enabled = 1
 
 [vm:100]
 enabled = 1
-# remote_keep = 2   # 该 VM 云端保留份数，留空跟随目录设置
+
+# 可选：该 VM 自己的云端目录（每项可单独设 keep），没有则跟随全局
+# [vm:100:remote:cloud/pve-backup]
+# keep = 3
+# enabled = 1
 mode = snapshot
 compress = zstd
 local_prune = keep-last=2
