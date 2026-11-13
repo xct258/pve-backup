@@ -82,6 +82,7 @@ FIXED_SCHEDULE = "monthly 1 00:00"
 FIXED_STORAGE = "local"
 FIXED_DUMPDIR = "/var/lib/vz/dump"
 FIXED_REMOTE = "webdav"
+DEFAULT_WEBDAV_URL = "http://192.168.50.4:5244/dav"
 
 GLOBAL_DEFAULTS = {
     "storage": FIXED_STORAGE,
@@ -269,7 +270,7 @@ def configure_webdav(cfg: dict) -> None:
     print("修改名称会创建新的 remote，旧 remote 不会被删除")
     try:
         name = input(f"远端名称 [{current}]: ").strip() or current
-        cur_url = rclone_config_get(name, "url")
+        cur_url = rclone_config_get(name, "url") or DEFAULT_WEBDAV_URL
         cur_user = rclone_config_get(name, "user")
         url = input(f"地址 [{cur_url}]: ").strip() or cur_url
         user = input(f"用户名 [{cur_user}]: ").strip() or cur_user
@@ -2931,7 +2932,7 @@ def _ui_move(rows, sel, step) -> int:
 def _ui_webdav_view(scr) -> None:
     cfg = load_conf()
     name = str(cfg["global"].get("remote", "webdav"))
-    url = rclone_config_get(name, "url")
+    url = rclone_config_get(name, "url") or DEFAULT_WEBDAV_URL
     user = rclone_config_get(name, "user")
     password = ""
     sel = 0

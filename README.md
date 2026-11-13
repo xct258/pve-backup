@@ -54,7 +54,7 @@ chmod +x pve-backup
 
 首次**无参数**运行且尚未安装到 `/usr/local/sbin/pve-backup` 时，会提示是否现在安装（输入 `y` 走上面的 install 流程）。不想被询问可以设置 `PVE_BACKUP_NO_PROMPT=1`。
 
-WebDAV 也可以在仪表盘「全局参数 → WebDAV 连接」里配置：远端名称、地址、用户名、密码，保存后自动测试连接；修改名称会新建一个 rclone remote，旧的不会删除。
+WebDAV 默认地址为 `http://192.168.50.4:5244/dav`，也可以在仪表盘「全局参数 → WebDAV 连接」里配置：远端名称、地址、用户名、密码，保存后自动测试连接；修改名称会新建一个 rclone remote，旧的不会删除。
 
 `install` 做的事：安装脚本、写入 `/etc/pve-backup.conf`、生成 `/etc/logrotate.d/pve-backup`、生成并启动 `pve-backup.service`、注册 rclone remote（给了 `--url/--user/--pass` 时）。
 
