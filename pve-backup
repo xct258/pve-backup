@@ -2464,12 +2464,15 @@ def _ui_header(info) -> list:
         auto_txt = "⚠ 已启用但服务未运行"
     else:
         auto_txt = "⏸ 已关闭"
-    svc = "● active" if info["running"] else "○ inactive"
+    if info["running"]:
+        svc, svc_attr = "● active", _ui_color(2)
+    else:
+        svc, svc_attr = "○ inactive", _ui_color(3)
     push = f"{info['notify_on'] or '-'} · {info['notify_url'] or '未配置'}"
     lines = [
         ("主机", info["host"], 0),
         ("自动备份", f"{auto_txt} · {info['schedule']} · 下次 {info['next']}", 0),
-        ("调度服务", svc, 0),
+        ("调度服务", svc, svc_attr),
         ("虚拟机", f"{info['vms']} 台（启用 {info['vms_on']}）", 0),
         ("远端", f"{info['remote']} → {info['paths'] or '未配置'}", 0),
         ("推送", push, 0),
