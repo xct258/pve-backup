@@ -77,7 +77,7 @@ RCLONE_HINT = (
     "  curl https://rclone.org/install.sh | sudo bash"
 )
 
-# 固定配置（不可在界面/命令行修改）
+# 固定配置（调度/存储不可改，remote 名称可自定义）
 FIXED_SCHEDULE = "monthly 1 00:00"
 FIXED_STORAGE = "local"
 FIXED_DUMPDIR = "/var/lib/vz/dump"
@@ -203,58 +203,85 @@ def rclone_config_get(remote: str, key: str) -> str:
     return ""
 
 
+def create_webdav_remote(cfg: dict, name: str, url: str, user: str,
+                         password: str = "") -> tuple:
+    """创建/更新 rclone WebDAV remote；密码留空时沿用已有的。"""
+    name = str(name or "").strip()
+    if not re.fullmatch(r"[A-Za-z0-9_][A-Za-z0-9_.\-]*", name):
+        return False, "远端名称只能包含字母、数字、下划线、点和短横线，且不能以短横线开头"
+    url = str(url or "").strip()
+    user = str(user or "").strip()
+    if not url or not user:
+        return False, "地址和用户名不能为空"
+
+    obscured = ""
+    if password:
+        obscured = subprocess.run([RCLONE, "obscure", password],
+                                  capture_output=True, text=True).stdout.strip()
+    else:
+        obscured = rclone_config_get(name, "pass")
+
+    cmd = [RCLONE, "config", "create", name, "webdav",
+           f"url={url}", "vendor=other", f"user={user}",
+           "--config", RCLONE_CONFIG]
+    if obscured:
+        cmd.append(f"pass={obscured}")
+    proc = subprocess.run(cmd, capture_output=True, text=True)
+    if proc.returncode != 0:
+        detail = (proc.stderr or proc.stdout).strip()[:300]
+        return False, detail or "写入 rclone 配置失败"
+
+    cfg["global"]["remote"] = name
+    save_conf(cfg)
+    log(f"WebDAV remote 已更新: {name} -> {url} (user {user})")
+    return True, f"已保存 remote '{name}'"
+
+
+def test_webdav_remote(name: str) -> bool:
+    try:
+        proc = subprocess.run([RCLONE, "lsd", f"{name}:"],
+                              capture_output=True, text=True, timeout=25,
+                              env={**os.environ, "RCLONE_CONFIG": RCLONE_CONFIG})
+    except subprocess.TimeoutExpired:
+        print("连接测试超时")
+        return False
+    except OSError as exc:
+        print(f"连接测试失败: {exc}")
+        return False
+    if proc.returncode == 0:
+        count = len([x for x in proc.stdout.splitlines() if x.strip()])
+        print(f"连接成功，根目录 {count} 项")
+        return True
+    lines = (proc.stderr or proc.stdout).strip().splitlines()
+    print("连接失败" + (("：" + lines[-1][:200]) if lines else ""))
+    return False
+
+
 def configure_webdav(cfg: dict) -> None:
     if not require_rclone():
         return
     import getpass
 
-    remote = cfg["global"].get("remote", "webdav")
-    cur_url = rclone_config_get(remote, "url")
-    cur_user = rclone_config_get(remote, "user")
-    cur_pass = rclone_config_get(remote, "pass")
-
+    current = cfg["global"].get("remote", "webdav")
     print("")
     print("WebDAV 连接设置（凭证保存在 /root/.config/rclone/rclone.conf）")
     print("地址示例: http://192.168.50.4:5244/dav  （只填到 /dav，不带备份子目录）")
+    print("修改名称会创建新的 remote，旧 remote 不会被删除")
     try:
+        name = input(f"远端名称 [{current}]: ").strip() or current
+        cur_url = rclone_config_get(name, "url")
+        cur_user = rclone_config_get(name, "user")
         url = input(f"地址 [{cur_url}]: ").strip() or cur_url
         user = input(f"用户名 [{cur_user}]: ").strip() or cur_user
         pwd = getpass.getpass("密码（留空保持当前）: ")
     except (EOFError, KeyboardInterrupt):
         return
 
-    if not url or not user:
-        print("地址和用户名不能为空")
-        return
-
-    if pwd:
-        obscured = subprocess.run([RCLONE, "obscure", pwd],
-                                  capture_output=True, text=True).stdout.strip()
-    else:
-        obscured = cur_pass
-
-    cmd = [RCLONE, "config", "create", remote, "webdav",
-           f"url={url}", "vendor=other", f"user={user}",
-           "--config", RCLONE_CONFIG]
-    if obscured:
-        cmd.append(f"pass={obscured}")
-
-    rc = subprocess.run(cmd, capture_output=True, text=True).returncode
-    if rc != 0:
-        print("保存失败，请检查 rclone 配置")
-        return
-
-    print("已保存，正在测试连接...")
-    test = subprocess.run([RCLONE, "lsd", f"{remote}:"], capture_output=True, text=True)
-    if test.returncode == 0:
-        print("连接成功 ✅")
-        log("WebDAV 凭证已更新，连接成功")
-    else:
-        msg = (test.stderr or test.stdout).strip().splitlines()
-        print("连接失败 ❌")
-        if msg:
-            print("  " + msg[-1][:200])
-        log("WebDAV 凭证已更新，但连接失败")
+    ok, message = create_webdav_remote(cfg, name, url, user, pwd)
+    print(message)
+    if ok:
+        print("正在测试连接...")
+        test_webdav_remote(name)
 
 
 def notify_daemon() -> None:
@@ -520,7 +547,9 @@ def _apply_fixed(cfg: dict) -> None:
     g["schedule"] = FIXED_SCHEDULE
     g["storage"] = FIXED_STORAGE
     g["dumpdir"] = FIXED_DUMPDIR
-    g["remote"] = FIXED_REMOTE
+    # remote 名称允许自定义（rclone remote），留空时回落到默认
+    if not str(g.get("remote", "") or "").strip():
+        g["remote"] = FIXED_REMOTE
 
 
 def _migrate_paths(cfg: dict) -> None:
@@ -2319,18 +2348,16 @@ def do_install(cfg: dict, args) -> bool:
             say(f"  [1/6] 警告: 找不到 {SELF_PATH}，请从脚本副本重新执行 install")
             return False
 
+    if getattr(args, "remote", None):
+        g["remote"] = str(args.remote).strip()
     if getattr(args, "url", None):
         if not args.user:
             say("错误: --url 需要同时提供 --user")
             return False
-        obscured = subprocess.run([RCLONE, "obscure", args.passwd or ""],
-                                  capture_output=True, text=True).stdout.strip()
-        rc = subprocess.run(
-            [RCLONE, "config", "create", g["remote"], "webdav",
-             f"url={args.url}", "vendor=other", f"user={args.user}",
-             f"pass={obscured}", "--config", RCLONE_CONFIG],
-            capture_output=True, text=True).returncode
-        say(f"  [2/6] {'已注册' if rc == 0 else '注册失败'} rclone remote: {g['remote']}")
+        ok, msg = create_webdav_remote(
+            cfg, g.get("remote", "webdav"), args.url, args.user,
+            args.passwd or "")
+        say(f"  [2/6] {msg}")
     elif rclone_remote_exists(g.get("remote", "")):
         say(f"  [2/6] rclone remote 已存在: {g['remote']}")
     else:
@@ -2737,7 +2764,7 @@ def _ui_choice(scr, title, options, default=0, info=None):
             return None
 
 
-def _ui_input(scr, title, default="", hint=""):
+def _ui_input(scr, title, default="", hint="", secret=False):
     buf = str(default)
     pos = len(buf)
     while True:
@@ -2750,10 +2777,12 @@ def _ui_input(scr, title, default="", hint=""):
         _ui_box(scr, y0, x0, bh, bw, title)
         if hint:
             _ui_add(scr, y0 + 1, x0 + 2, hint, curses.A_DIM)
-        _ui_add(scr, y0 + 3, x0 + 2, buf[: bw - 4])
+        shown = "*" * len(buf) if secret else buf
+        _ui_add(scr, y0 + 3, x0 + 2, shown[: bw - 4])
         try:
             curses.curs_set(1)
-            scr.move(y0 + 3, min(x0 + 2 + _ui_width(buf[:pos]), w - 2))
+            offset = pos if secret else _ui_width(buf[:pos])
+            scr.move(y0 + 3, min(x0 + 2 + offset, w - 2))
         except Exception:
             pass
         _ui_add(scr, y0 + bh - 1, x0 + 2, " Enter 确认  Esc 取消 ")
@@ -2897,6 +2926,57 @@ def _ui_move(rows, sel, step) -> int:
         if rows[i]["kind"] == "item":
             return i
     return sel
+
+
+def _ui_webdav_view(scr) -> None:
+    cfg = load_conf()
+    name = str(cfg["global"].get("remote", "webdav"))
+    url = rclone_config_get(name, "url")
+    user = rclone_config_get(name, "user")
+    password = ""
+    sel = 0
+    while True:
+        has_pass = bool(password or rclone_config_get(name, "pass"))
+        opts = [
+            f"远端名称    {name}",
+            f"地址        {url or '未设置'}",
+            f"用户名      {user or '未设置'}",
+            f"密码        {'保存时更新' if password else ('已设置' if has_pass else '未设置')}",
+            "保存并测试连接",
+            "返回",
+        ]
+        idx = _ui_choice(scr, "WebDAV 连接", opts, default=sel, info=[
+            "凭证保存在 /root/.config/rclone/rclone.conf",
+            "地址只填到 /dav，不带备份子目录；改名称会新建 remote",
+        ])
+        if idx is None or idx == 5:
+            return
+        sel = idx
+        if idx == 0:
+            v = _ui_input(scr, "远端名称", name, "字母/数字/下划线/点/短横线")
+            if v and v.strip():
+                name = v.strip()
+        elif idx == 1:
+            v = _ui_input(scr, "地址", url, "如 http://192.168.50.4:5244/dav")
+            if v is not None:
+                url = v.strip()
+        elif idx == 2:
+            v = _ui_input(scr, "用户名", user)
+            if v is not None:
+                user = v.strip()
+        elif idx == 3:
+            v = _ui_input(scr, "密码", "", "留空表示不修改", secret=True)
+            if v is not None:
+                password = v
+        elif idx == 4:
+            ok, msg = create_webdav_remote(cfg, name, url, user, password)
+            if not ok:
+                _ui_msg(scr, "保存失败", msg)
+                continue
+            text = _ui_capture(test_webdav_remote, name)
+            _ui_pager(scr, "连接测试", text)
+            _ui_bust()
+            return
 
 
 def _ui_snapshot_line(cfg) -> str:
@@ -3331,6 +3411,7 @@ def _ui_vm_view(scr) -> None:
 
 
 def _ui_remotes_view(scr) -> None:
+    sel = 0
     while True:
         cfg = load_conf()
         g = cfg["global"]
@@ -3341,9 +3422,10 @@ def _ui_remotes_view(scr) -> None:
             state = "" if r["enabled"] != "0" else "（停用）"
             opts.append(f"{pad(r['path'], 28)} 保留 {keep or '不限'}{state}")
         opts += ["添加远端目录", "返回"]
-        idx = _ui_choice(scr, "远端目录（每个目录独立保留）", opts)
+        idx = _ui_choice(scr, "远端目录（每个目录独立保留）", opts, default=sel)
         if idx is None or idx == len(opts) - 1:
             return
+        sel = idx
         if idx == len(entries):
             path = _ui_input(scr, "添加远端目录", "",
                              "相对 WebDAV 根，如 阿里网盘/backup")
@@ -3402,6 +3484,7 @@ def _ui_global_view(scr) -> None:
             f"推送时机        {g.get('notify_on')}",
             f"推送地址        {g.get('notify_url')}",
             f"新目录默认保留  {g.get('remote_keep') or '不限'}",
+            f"WebDAV 连接      {g.get('remote')}",
             "返回",
         ]
         idx = _ui_choice(scr, "全局参数", opts)
@@ -3460,6 +3543,9 @@ def _ui_global_view(scr) -> None:
                           "新增远端目录时默认使用，0 表示不清理")
             if v is not None:
                 g["remote_keep"] = v.strip()
+        elif idx == 10:
+            _ui_webdav_view(scr)
+            continue
         save_conf(cfg)
         _ui_bust()
 
@@ -3751,6 +3837,7 @@ def build_install_parser() -> argparse.ArgumentParser:
     ap.add_argument("--paths", help="多个远端基础目录，逗号分隔")
     ap.add_argument("--host", help="远端主机子目录名（默认系统主机名）")
     ap.add_argument("--keep", help="保留最新 N 个时间文件夹")
+    ap.add_argument("--remote", help="rclone remote 名称，默认 webdav")
     ap.add_argument("--url")
     ap.add_argument("--user")
     ap.add_argument("--pass", dest="passwd")
