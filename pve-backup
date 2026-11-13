@@ -90,8 +90,6 @@ GLOBAL_DEFAULTS = {
     "local_prune": "keep-last=3",
     "remote": FIXED_REMOTE,
     "host_name": "",
-    "remote_paths": "",
-    "remote_subdir": "",
     "remote_keep": "3",
     "delete_local": "0",
     "verify_hash": "0",
@@ -528,7 +526,7 @@ def _migrate_paths(cfg: dict) -> None:
 
 
 def load_conf() -> dict:
-    cfg = {"global": dict(GLOBAL_DEFAULTS), "vms": {}}
+    cfg = {"global": dict(GLOBAL_DEFAULTS), "vms": {}, "remotes": []}
     if not os.path.isfile(CONF):
         return cfg
 
@@ -558,9 +556,38 @@ def load_conf() -> dict:
                 cfg["vms"][vmid] = {k: v for k, v in cp.items(sect)}
                 for legacy in ("name", "schedule", "retention", "remote_subdir", "remote_keep"):
                     cfg["vms"][vmid].pop(legacy, None)
+        elif sect.startswith("remote:"):
+            path = sect.split(":", 1)[1].strip().strip("/")
+            if not path:
+                continue
+            d = {k: v for k, v in cp.items(sect)}
+            cfg["remotes"].append({
+                "path": path,
+                "keep": str(d.get("keep", "")).strip(),
+                "enabled": str(d.get("enabled", "1")).strip(),
+            })
     _migrate_paths(cfg)
     _apply_fixed(cfg)
+    if not cfg["remotes"]:
+        cfg["remotes"] = _migrate_remotes(cfg)
     return cfg
+
+
+def _migrate_remotes(cfg: dict) -> list:
+    """旧版 remote_paths（逗号/换行分隔）迁移成每目录一条记录。"""
+    g = cfg["global"]
+    raw = str(g.get("remote_paths", "") or "").strip()
+    if not raw:
+        return []
+    raw = raw.replace("，", ",")
+    parts = raw.splitlines() if "\n" in raw else raw.split(",")
+    keep = str(g.get("remote_keep", "") or "").strip()
+    out = []
+    for p in parts:
+        p = p.strip().strip("/")
+        if p:
+            out.append({"path": p, "keep": keep, "enabled": "1"})
+    return out
 
 
 def migrate_legacy(text: str, cfg: dict) -> dict:
@@ -597,8 +624,16 @@ def migrate_legacy(text: str, cfg: dict) -> dict:
 
 def save_conf(cfg: dict) -> None:
     cfg["global"].pop("upload_failure_fatal", None)
+    cfg["global"].pop("remote_paths", None)
+    cfg["global"].pop("remote_subdir", None)
     cp = configparser.ConfigParser(interpolation=None)
-    cp["global"] = {k: str(v) for k, v in cfg["global"].items()}
+    cp["global"] = {k: str(v) for k, v in cfg["global"].items() if str(v) != ""}
+    for r in cfg.get("remotes", []):
+        path = str(r.get("path", "")).strip().strip("/")
+        if not path:
+            continue
+        cp[f"remote:{path}"] = {"keep": str(r.get("keep", "")),
+                                "enabled": str(r.get("enabled", "1"))}
     for vmid in sorted(cfg["vms"], key=lambda x: int(x) if x.isdigit() else 0):
         vm = cfg["vms"][vmid]
         cp[f"vm:{vmid}"] = {k: str(v) for k, v in vm.items() if str(v) != ""}
@@ -752,16 +787,33 @@ def run_dir_name(ts: dt.datetime = None) -> str:
     return f"{t:%Y年%m月%d日%H点%M分}"
 
 
+def remote_entries(cfg: dict, only_enabled: bool = False) -> list:
+    """返回每个远端目录的独立配置：path / keep / enabled。"""
+    out = []
+    for r in cfg.get("remotes", []):
+        path = str(r.get("path", "")).strip().strip("/")
+        if not path:
+            continue
+        entry = {
+            "path": path,
+            "keep": str(r.get("keep", "")).strip(),
+            "enabled": str(r.get("enabled", "1")).strip(),
+        }
+        if only_enabled and entry["enabled"] == "0":
+            continue
+        out.append(entry)
+    return out
+
+
 def remote_paths(cfg: dict) -> list:
-    g = cfg["global"]
-    raw = str(g.get("remote_paths", "") or "").strip()
-    if not raw:
-        raw = str(g.get("remote_subdir", "") or "").strip()
-    if not raw:
-        return []
-    raw = raw.replace("，", ",")
-    parts = raw.splitlines() if "\n" in raw else raw.split(",")
-    return [p.strip().strip("/") for p in parts if p.strip()]
+    return [r["path"] for r in remote_entries(cfg, only_enabled=True)]
+
+
+def remote_keep_of(cfg: dict, path: str) -> str:
+    for r in remote_entries(cfg):
+        if r["path"] == path:
+            return r["keep"] or str(cfg["global"].get("remote_keep", "") or "").strip()
+    return str(cfg["global"].get("remote_keep", "") or "").strip()
 
 
 def host_label(cfg: dict) -> str:
@@ -782,13 +834,17 @@ def list_run_dirs(base: str) -> list:
 
 
 def enforce_folder_keep(cfg: dict):
-    """对每个远端目录，只保留最新 N 个时间文件夹，超出的整个文件夹删除。"""
-    keep = str(cfg["global"].get("remote_keep", "")).strip()
-    if not keep.isdigit() or int(keep) <= 0:
-        return None
-    keep = int(keep)
+    """对每个远端目录按各自的保留数量清理时间文件夹。"""
+    remote = cfg["global"].get("remote", FIXED_REMOTE)
+    host = host_label(cfg)
     msgs = []
-    for base in remote_bases(cfg):
+    for r in remote_entries(cfg, only_enabled=True):
+        base = f"{remote}:{r['path']}/{host}"
+        keep = r["keep"] or str(cfg["global"].get("remote_keep", "") or "").strip()
+        if not keep.isdigit() or int(keep) <= 0:
+            msgs.append(f"{base}: 不清理")
+            continue
+        keep = int(keep)
         dirs = list_run_dirs(base)
         if len(dirs) <= keep:
             msgs.append(f"{base}: {len(dirs)} 个")
@@ -882,9 +938,13 @@ def act_status(cfg: dict) -> None:
     print(f"  {pad('本地目录', 10)} {g.get('dumpdir')}（存储 {g.get('storage')}）")
     print(f"  {pad('主机标识', 10)} {host_label(cfg)}")
     print(f"  {pad('远端目录', 10)}")
-    for b in remote_bases(cfg):
-        print(f"    {b}")
-    print(f"  {pad('保留文件夹', 10)} {g.get('remote_keep') or '不限'}")
+    entries = remote_entries(cfg)
+    if not entries:
+        print("    (未配置，使用 install --paths 或编辑 [remote:路径] 段)")
+    for r in entries:
+        keep = r["keep"] or str(g.get("remote_keep", "") or "").strip()
+        flag = "" if r["enabled"] != "0" else "（已停用）"
+        print(f"    {g.get('remote')}:{r['path']}/{host_label(cfg)}  保留 {keep or '不限'}{flag}")
     print(f"  {pad('远端连通', 10)} {'✅ 可访问' if rclone_remote_exists(g.get('remote', '')) else '❌ 不可用'}")
     if not rclone_available():
         print(f"  {pad('rclone', 10)} ❌ 未安装（apt install -y rclone）")
@@ -1123,7 +1183,9 @@ def act_list(cfg: dict) -> None:
     if not rclone_remote_exists(g.get("remote", "")):
         print("  remote 不可用")
         return
-    for base in remote_bases(cfg):
+    for r in remote_entries(cfg, only_enabled=True):
+        base = f"{g.get('remote')}:{r['path']}/{host_label(cfg)}"
+        keep = r["keep"] or str(g.get("remote_keep", "") or "").strip()
         print("")
         print(f"  {base}")
         dirs = list_run_dirs(base)
@@ -1149,13 +1211,21 @@ def act_list(cfg: dict) -> None:
             print(f"    {d}/  ({len(rows)} 个文件 / {hsize(total)})")
             for name, size, ts in sorted(rows):
                 print(f"      {pad(name, 46)}{hsize(size):>10}  {ts}")
-        print(f"    共 {len(dirs)} 个时间文件夹（保留上限 {cfg['global'].get('remote_keep') or '不限'}）")
+        print(f"    共 {len(dirs)} 个时间文件夹（保留 {keep or '不限'}）")
 
 
 def act_config(cfg: dict) -> None:
     section(f"全局配置 ({CONF})")
     for k, v in cfg["global"].items():
         print(f"  {pad(k, 18)} {v}")
+    section("远端目录")
+    entries = remote_entries(cfg)
+    if not entries:
+        print("  (未配置)")
+    for r in entries:
+        keep = r["keep"] or str(cfg["global"].get("remote_keep", "") or "").strip()
+        print(f"  {pad(r['path'], 40)} 保留 {keep or '不限'}  "
+              f"{'启用' if r['enabled'] != '0' else '停用'}")
     guests = guest_map()
     for vmid in sorted(cfg["vms"], key=lambda x: int(x) if x.isdigit() else 0):
         section(f"虚拟机 {vmid}")
@@ -1163,10 +1233,6 @@ def act_config(cfg: dict) -> None:
         print(f"  {pad('名称(自动)', 18)} {p['name'] or '-'}")
         for k in ("enabled", "mode", "compress", "local_prune",
                   "delete_local", "verify_hash"):
-            val = p[k]
-            if isinstance(val, bool):
-                val = "1" if val else "0"
-            print(f"  {pad(k, 18)} {val}")
             val = p[k]
             if isinstance(val, bool):
                 val = "1" if val else "0"
@@ -1445,17 +1511,72 @@ def edit_vm_interactive(cfg: dict, vmid: str) -> None:
 
 
 # ------------------------------------------------------------------ 全局配置
+def edit_remotes_interactive(cfg: dict) -> None:
+    """文本菜单版的远端目录管理（每个目录独立保留数量）。"""
+    while True:
+        entries = remote_entries(cfg)
+        opts = [f"{r['path']}   保留 {r['keep'] or '(默认)'}   "
+                f"{'启用' if r['enabled'] != '0' else '停用'}" for r in entries]
+        opts += ["添加远端目录", "返回"]
+        idx = pick("远端目录管理", opts)
+        if idx is None or idx == len(opts) - 1:
+            return
+        if idx == len(entries):
+            try:
+                path = input("目录路径（相对 WebDAV 根，如 阿里网盘/backup）: ").strip().strip("/")
+                if not path:
+                    continue
+                keep = input(f"保留数量（回车默认 {cfg['global'].get('remote_keep') or '不限'}）: ").strip()
+            except (EOFError, KeyboardInterrupt):
+                continue
+            cfg["remotes"].append({"path": path, "keep": keep, "enabled": "1"})
+            save_conf(cfg)
+            print(f"已添加 {path}")
+            continue
+
+        r = entries[idx]
+        target = next((x for x in cfg["remotes"]
+                       if str(x.get("path", "")).strip().strip("/") == r["path"]), None)
+        if target is None:
+            continue
+        act = pick(f"管理 {r['path']}", [
+            "修改路径", "修改保留数量", "启用/停用", "删除", "返回"])
+        if act is None:
+            continue
+        if act == 0:
+            try:
+                v = input(f"新路径（当前 {r['path']}）: ").strip().strip("/")
+            except (EOFError, KeyboardInterrupt):
+                continue
+            if v:
+                target["path"] = v
+        elif act == 1:
+            try:
+                v = input(f"保留数量（当前 {r['keep'] or '默认'}，0 表示不清理）: ").strip()
+            except (EOFError, KeyboardInterrupt):
+                continue
+            target["keep"] = v
+        elif act == 2:
+            target["enabled"] = "0" if r["enabled"] != "0" else "1"
+        elif act == 3:
+            if confirm(f"删除远端目录 {r['path']}？（不会删除已上传的文件）", "是，删除", "否，取消"):
+                cfg["remotes"] = [x for x in cfg["remotes"] if x is not target]
+        if act in (0, 1, 2, 3):
+            save_conf(cfg)
+            print("已保存")
+
+
 def edit_global_config(cfg: dict) -> None:
     g = cfg["global"]
     while True:
         items = [
             ("webdav", "WebDAV 连接（地址/账号/密码）"),
             ("host_name", f"远端主机子目录: {g.get('host_name') or host_label(cfg)}"),
-            ("remote_paths", f"远端目录（多个用逗号分隔）: {g.get('remote_paths') or g.get('remote_subdir') or '(未设置)'}"),
+            ("remotes", f"远端目录管理（{len(remote_entries(cfg))} 个，各自保留）"),
             ("mode", f"默认备份模式: {g.get('mode')}"),
             ("compress", f"默认压缩: {g.get('compress')}"),
             ("local_prune", f"默认本机保留: {g.get('local_prune')}"),
-            ("remote_keep", f"保留时间文件夹数: {g.get('remote_keep') or '<不限>'}"),
+            ("remote_keep", f"新目录默认保留数量: {g.get('remote_keep') or '<不限>'}"),
         ]
         idx = pick("修改全局配置", [x[1] for x in items] + ["返回"])
         if idx is None or idx == len(items):
@@ -1465,6 +1586,10 @@ def edit_global_config(cfg: dict) -> None:
 
         if key == "webdav":
             configure_webdav(cfg)
+            continue
+
+        if key == "remotes":
+            edit_remotes_interactive(cfg)
             continue
 
         if key == "mode":
@@ -1610,14 +1735,24 @@ def do_install(cfg: dict, args) -> bool:
             g[key] = val
     if getattr(args, "prune", None) is not None:
         g["local_prune"] = args.prune
-    if getattr(args, "paths", None) is not None:
-        g["remote_paths"] = args.paths
-    elif getattr(args, "subdir", None) is not None:
-        g["remote_paths"] = args.subdir
-    if getattr(args, "host", None):
-        g["host_name"] = args.host
     if getattr(args, "keep", None) is not None:
         g["remote_keep"] = args.keep
+    raw_paths = None
+    if getattr(args, "paths", None) is not None:
+        raw_paths = args.paths
+    elif getattr(args, "subdir", None) is not None:
+        raw_paths = args.subdir
+    if raw_paths is not None:
+        raw_paths = str(raw_paths).replace("，", ",")
+        parts = raw_paths.splitlines() if "\n" in raw_paths else raw_paths.split(",")
+        cfg["remotes"] = [
+            {"path": p.strip().strip("/"),
+             "keep": str(g.get("remote_keep", "") or "").strip(),
+             "enabled": "1"}
+            for p in parts if p.strip()
+        ]
+    if getattr(args, "host", None):
+        g["host_name"] = args.host
 
     if getattr(args, "no_timer", False):
         g["auto_enabled"] = "0"
@@ -2055,6 +2190,10 @@ def _ui_info() -> dict:
     g = cfg["global"]
     running = run_capture(["systemctl", "is-active", DAEMON_UNIT]).strip() == "active"
     nxt = next_run(g.get("schedule"))
+    entries = remote_entries(cfg, only_enabled=True)
+    paths = "、".join(
+        f"{r['path']}（保留 {r['keep'] or g.get('remote_keep') or '不限'}）"
+        for r in entries)
     info = {
         "cfg": cfg,
         "host": host_label(cfg),
@@ -2065,7 +2204,7 @@ def _ui_info() -> dict:
         "vms": len(cfg["vms"]),
         "vms_on": len(enabled_vmids(cfg)),
         "remote": g.get("remote", ""),
-        "paths": g.get("remote_paths", ""),
+        "paths": paths,
         "keep": g.get("remote_keep", ""),
         "notify_on": g.get("notify_on", ""),
         "notify_url": g.get("notify_url", ""),
@@ -2116,7 +2255,7 @@ def _ui_header(info) -> list:
         ("自动备份", f"{auto_txt} · {info['schedule']} · 下次 {info['next']}", 0),
         ("调度服务", svc, 0),
         ("虚拟机", f"{info['vms']} 台（启用 {info['vms_on']}）", 0),
-        ("远端", f"{info['remote']} → {info['paths'] or '未配置'} · 保留 {info['keep']}", 0),
+        ("远端", f"{info['remote']} → {info['paths'] or '未配置'}", 0),
         ("推送", push, 0),
     ]
     return lines
@@ -2293,6 +2432,62 @@ def _ui_vm_view(scr) -> None:
             msg = f"VM {vmid} 已{'启用' if vm['enabled'] == '1' else '停用'}"
 
 
+def _ui_remotes_view(scr) -> None:
+    while True:
+        cfg = load_conf()
+        g = cfg["global"]
+        entries = remote_entries(cfg)
+        opts = []
+        for r in entries:
+            keep = r["keep"] or str(g.get("remote_keep", "") or "").strip()
+            state = "" if r["enabled"] != "0" else "（停用）"
+            opts.append(f"{r['path']}    保留 {keep or '不限'}{state}")
+        opts += ["添加远端目录", "返回"]
+        idx = _ui_choice(scr, "远端目录（每个目录独立保留）", opts)
+        if idx is None or idx == len(opts) - 1:
+            return
+        if idx == len(entries):
+            path = _ui_input(scr, "添加远端目录", "",
+                             "相对 WebDAV 根，如 阿里网盘/backup")
+            if not (path and path.strip()):
+                continue
+            keep = _ui_input(scr, "保留数量", str(g.get("remote_keep", "")),
+                             "保留最新 N 个时间文件夹，0 表示不清理")
+            cfg["remotes"].append({"path": path.strip().strip("/"),
+                                   "keep": (keep or "").strip(),
+                                   "enabled": "1"})
+            save_conf(cfg)
+            _ui_bust()
+            continue
+
+        r = entries[idx]
+        target = next((x for x in cfg["remotes"]
+                       if str(x.get("path", "")).strip().strip("/") == r["path"]), None)
+        if target is None:
+            continue
+        act = _ui_choice(scr, r["path"], [
+            "修改路径", "修改保留数量", "启用/停用", "删除", "返回"])
+        if act is None or act == 4:
+            continue
+        if act == 0:
+            v = _ui_input(scr, "修改路径", r["path"])
+            if v and v.strip():
+                target["path"] = v.strip().strip("/")
+        elif act == 1:
+            v = _ui_input(scr, "保留数量",
+                          r["keep"] or str(g.get("remote_keep", "")),
+                          "0 或留空表示不清理")
+            if v is not None:
+                target["keep"] = v.strip()
+        elif act == 2:
+            target["enabled"] = "0" if r["enabled"] != "0" else "1"
+        elif act == 3:
+            if _ui_confirm(scr, f"删除远端目录 {r['path']}？（不删已上传文件）"):
+                cfg["remotes"] = [x for x in cfg["remotes"] if x is not target]
+        save_conf(cfg)
+        _ui_bust()
+
+
 def _ui_global_view(scr) -> None:
     while True:
         cfg = load_conf()
@@ -2302,11 +2497,11 @@ def _ui_global_view(scr) -> None:
             f"备份模式        {g.get('mode')}",
             f"压缩算法        {g.get('compress')}",
             f"本机保留        {g.get('local_prune')}",
-            f"远端保留份数    {g.get('remote_keep')}",
-            f"远端路径        {g.get('remote_paths')}",
+            f"远端目录        {len(remote_entries(cfg))} 个（各自独立保留）",
             f"主机标识        {g.get('host_name') or '(系统主机名)'}",
             f"推送时机        {g.get('notify_on')}",
             f"推送地址        {g.get('notify_url')}",
+            f"新目录默认保留  {g.get('remote_keep') or '不限'}",
             "返回",
         ]
         idx = _ui_choice(scr, "全局参数", opts)
@@ -2340,30 +2535,28 @@ def _ui_global_view(scr) -> None:
             if v is not None:
                 g["local_prune"] = v.strip()
         elif idx == 4:
-            v = _ui_input(scr, "远端保留份数", g.get("remote_keep", ""),
-                          "保留最新 N 个时间目录")
-            if v is not None and v.strip().isdigit():
-                g["remote_keep"] = v.strip()
+            _ui_remotes_view(scr)
+            continue
         elif idx == 5:
-            v = _ui_input(scr, "远端路径", g.get("remote_paths", ""),
-                          "多个用逗号分隔，如 cloud/pve-backup, nas/pve-backup")
-            if v is not None:
-                g["remote_paths"] = v.strip()
-        elif idx == 6:
             v = _ui_input(scr, "主机标识", g.get("host_name", ""),
                           "留空使用系统主机名")
             if v is not None:
                 g["host_name"] = v.strip()
-        elif idx == 7:
+        elif idx == 6:
             v = _ui_choice(scr, "推送时机", ["always（每次）", "failure（仅失败）",
                                              "never（关闭）"])
             if v is not None:
                 g["notify_on"] = ["always", "failure", "never"][v]
-        elif idx == 8:
+        elif idx == 7:
             v = _ui_input(scr, "推送地址", g.get("notify_url", ""),
                           "push-server 地址，留空关闭推送")
             if v is not None:
                 g["notify_url"] = v.strip()
+        elif idx == 8:
+            v = _ui_input(scr, "新目录默认保留", g.get("remote_keep", ""),
+                          "新增远端目录时默认使用，0 表示不清理")
+            if v is not None:
+                g["remote_keep"] = v.strip()
         save_conf(cfg)
         _ui_bust()
 

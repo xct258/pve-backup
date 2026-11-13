@@ -8,7 +8,6 @@ compress = zstd
 local_prune = keep-last=3
 remote = webdav
 host_name = pve-node1
-remote_paths = cloud/pve-backup, nas/pve-backup
 remote_keep = 6
 delete_local = 0
 verify_hash = 0
@@ -22,6 +21,14 @@ notify_url = https://push-server.o1-1.xct258.top
 notify_topic = server/pve-backup
 notify_on = always
 notify_timeout = 10
+
+[remote:cloud/pve-backup]
+keep = 6
+enabled = 1
+
+[remote:nas/pve-backup]
+keep = 3
+enabled = 1
 
 [vm:100]
 enabled = 1
