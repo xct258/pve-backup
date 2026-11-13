@@ -32,6 +32,7 @@ enabled = 1
 
 [vm:100]
 enabled = 1
+# remote_keep = 2   # 该 VM 云端保留份数，留空跟随目录设置
 mode = snapshot
 compress = zstd
 local_prune = keep-last=2

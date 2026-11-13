@@ -560,7 +560,7 @@ def load_conf() -> dict:
             vmid = sect.split(":", 1)[1].strip()
             if vmid:
                 cfg["vms"][vmid] = {k: v for k, v in cp.items(sect)}
-                for legacy in ("name", "schedule", "retention", "remote_subdir", "remote_keep"):
+                for legacy in ("name", "schedule", "retention", "remote_subdir"):
                     cfg["vms"][vmid].pop(legacy, None)
         elif sect.startswith("remote:"):
             path = sect.split(":", 1)[1].strip().strip("/")
@@ -791,6 +791,9 @@ RUN_DIR_RE = re.compile(
     r"|^\d{4}年\d{2}月\d{2}日\s?\d{2}点\d{2}分$"     # 中文格式：2026年11月13日11点50分
 )
 
+# vzdump-qemu-100-... / vzdump-lxc-101-... → 提取 VMID
+VM_ARCHIVE_RE = re.compile(r"vzdump-(?:qemu|lxc)-(\d+)-")
+
 
 def run_dir_name(ts: dt.datetime = None) -> str:
     # 时间目录会同步到 Windows/SMB：用中文写法最直观，且不含非法字符
@@ -852,6 +855,12 @@ def vm_remote_bases(cfg: dict, vmid) -> list:
     return [f"{remote}:{p}/{host}" for p in vm_remote_paths(cfg, vmid)]
 
 
+def vm_remote_keep(cfg: dict, vmid) -> str:
+    """该虚拟机的云端保留份数；空表示跟随所在目录的设置。"""
+    vm = cfg.get("vms", {}).get(str(vmid), {})
+    return str(vm.get("remote_keep", "") or "").strip()
+
+
 def list_run_dirs(base: str) -> list:
     out = run_capture([RCLONE, "lsf", base, "--config", RCLONE_CONFIG, "--dirs-only"])
     names = [x.strip().rstrip("/") for x in out.splitlines() if x.strip()]
@@ -859,7 +868,12 @@ def list_run_dirs(base: str) -> list:
 
 
 def enforce_folder_keep(cfg: dict):
-    """对每个远端目录按各自的保留数量清理时间文件夹。"""
+    """按目录设置 + 每台虚拟机各自的保留数量清理时间文件夹。
+
+    同一个时间文件夹里通常有多台虚拟机的归档：只有当该文件夹内所有
+    虚拟机都超过了各自的保留数时，才删除整个文件夹。
+    无法识别归属的文件所在文件夹一律保留。
+    """
     remote = cfg["global"].get("remote", FIXED_REMOTE)
     host = host_label(cfg)
     paths = [r["path"] for r in remote_entries(cfg, only_enabled=True)]
@@ -868,26 +882,61 @@ def enforce_folder_keep(cfg: dict):
             p = str(p).strip().strip("/")
             if p and p not in paths:
                 paths.append(p)
+
     msgs = []
     for path in paths:
         base = f"{remote}:{path}/{host}"
-        keep = remote_keep_of(cfg, path)
-        if not keep.isdigit() or int(keep) <= 0:
-            msgs.append(f"{base}: 不清理")
-            continue
-        keep = int(keep)
+        dir_keep = remote_keep_of(cfg, path)
         dirs = list_run_dirs(base)
-        if len(dirs) <= keep:
-            msgs.append(f"{base}: {len(dirs)} 个")
+        if not dirs:
+            msgs.append(f"{base}: 0 个")
             continue
+
+        vm_dirs = {}
+        protected = set()
+        for name in dirs:
+            files = run_capture([RCLONE, "lsf", f"{base}/{name}",
+                                 "--files-only", "--config", RCLONE_CONFIG]).splitlines()
+            hit = False
+            for f in files:
+                m = VM_ARCHIVE_RE.search(f)
+                if m:
+                    vm_dirs.setdefault(m.group(1), []).append(name)
+                    hit = True
+                else:
+                    protected.add(name)
+            if files and not hit:
+                protected.add(name)
+
+        doomed = []
+        for name in dirs:
+            if name in protected:
+                continue
+            owners = [v for v, lst in vm_dirs.items() if name in lst]
+            if not owners:
+                continue
+            drop = True
+            for v in owners:
+                keep = vm_remote_keep(cfg, v) or dir_keep
+                if not str(keep).strip().isdigit() or int(keep) <= 0:
+                    drop = False
+                    break
+                lst = vm_dirs[v]
+                age = len(lst) - lst.index(name)   # 1 = 最新
+                if age <= int(keep):
+                    drop = False
+                    break
+            if drop:
+                doomed.append(name)
+
         removed = 0
-        for name in dirs[:-keep]:
+        for name in doomed:
             rc = subprocess.run([RCLONE, "purge", f"{base}/{name}",
                                  "--config", RCLONE_CONFIG],
                                 capture_output=True, text=True).returncode
             if rc == 0:
                 removed += 1
-        msgs.append(f"{base}: 删除 {removed} 个，保留 {keep} 个")
+        msgs.append(f"{base}: 删除 {removed} 个，保留 {len(dirs) - removed} 个")
     return "；".join(msgs) if msgs else None
 
 
@@ -1279,6 +1328,8 @@ def act_config(cfg: dict) -> None:
         sel = cfg.get("vm_remotes", {}).get(vmid) or []
         print(f"  {pad('云端目录', 18)} "
               f"{'、'.join(sel) if sel else '跟随全局'}")
+        print(f"  {pad('云端保留', 18)} "
+              f"{vm_remote_keep(cfg, vmid) or '跟随目录设置'}")
 
 
 # ------------------------------------------------------------------ 虚拟机管理
@@ -1533,6 +1584,7 @@ def edit_vm_interactive(cfg: dict, vmid: str) -> None:
         sel = cfg.get("vm_remotes", {}).get(str(vmid)) or []
         remotes_txt = (f"自定义 {len(sel)} 个" if sel
                        else f"跟随全局（{len(remote_paths(cfg))} 个）")
+        vkeep = vm_remote_keep(cfg, vmid)
         labels = [
             ("mode", f"备份模式: {p['mode']}"),
             ("compress", f"压缩: {p['compress']}"),
@@ -1540,6 +1592,7 @@ def edit_vm_interactive(cfg: dict, vmid: str) -> None:
             ("delete_local", f"上传后删本地: {p['delete_local']}"),
             ("verify_hash", f"SHA256 校验: {p['verify_hash']}"),
             ("remotes", f"云端备份目录: {remotes_txt}"),
+            ("remote_keep", f"云端保留份数: {vkeep or '跟随目录设置'}"),
             ("enabled", f"启用: {'1' if p['enabled'] else '0'}"),
         ]
         idx = pick(f"修改 VM {vmid}（{p['name'] or '-'}）参数",
@@ -1554,6 +1607,19 @@ def edit_vm_interactive(cfg: dict, vmid: str) -> None:
 
         if key == "remotes":
             edit_vm_remotes_interactive(cfg, vmid)
+            continue
+
+        if key == "remote_keep":
+            try:
+                v = input(f"云端保留份数（当前 {vkeep or '跟随目录设置'}，"
+                          "留空跟随目录，0 不清理）: ").strip()
+            except (EOFError, KeyboardInterrupt):
+                continue
+            if v:
+                vm["remote_keep"] = v
+            else:
+                vm.pop("remote_keep", None)
+            save_conf(cfg)
             continue
 
         if key == "mode":
@@ -2401,8 +2467,8 @@ def _ui_vm_remotes(scr, vmid) -> None:
 
 
 def _ui_vm_edit(scr, vmid) -> None:
-    fields = ["mode", "compress", "local_prune",
-              "delete_local", "verify_hash", "remotes", "enabled"]
+    fields = ["mode", "compress", "local_prune", "delete_local",
+              "verify_hash", "remotes", "remote_keep", "enabled"]
     while True:
         cfg = load_conf()
         guests = guest_map()
@@ -2412,6 +2478,7 @@ def _ui_vm_edit(scr, vmid) -> None:
             remotes_txt = f"自定义（{len(sel)} 个）"
         else:
             remotes_txt = f"跟随全局（{len(remote_paths(cfg))} 个）"
+        vkeep = vm_remote_keep(cfg, vmid)
         opts = [
             f"备份模式        {p['mode']}",
             f"压缩算法        {p['compress']}",
@@ -2419,6 +2486,7 @@ def _ui_vm_edit(scr, vmid) -> None:
             f"上传后删本地    {'是' if p['delete_local'] == '1' else '否'}",
             f"SHA256 校验     {'是' if p['verify_hash'] == '1' else '否'}",
             f"云端备份目录    {remotes_txt}",
+            f"云端保留份数    {vkeep or '跟随目录设置'}",
             f"启用备份        {'是' if p['enabled'] else '否'}",
             "完成并返回",
         ]
@@ -2429,6 +2497,17 @@ def _ui_vm_edit(scr, vmid) -> None:
         vm = cfg["vms"].setdefault(vmid, {"enabled": "1"})
         if key == "remotes":
             _ui_vm_remotes(scr, vmid)
+            continue
+        if key == "remote_keep":
+            v = _ui_input(scr, "云端保留份数", vkeep,
+                          "留空跟随目录设置，0 表示不清理")
+            if v is not None:
+                if v.strip():
+                    vm["remote_keep"] = v.strip()
+                else:
+                    vm.pop("remote_keep", None)
+                save_conf(cfg)
+                _ui_bust()
             continue
         if key == "mode":
             v = _ui_choice(scr, "备份模式", ["snapshot（快照，不停机）",
