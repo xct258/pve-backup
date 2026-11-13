@@ -743,8 +743,10 @@ RUN_DIR_RE = re.compile(r"^\d{4}-\d{2}-\d{2}_\d{2}:\d{2}$")
 
 
 def run_dir_name(ts: dt.datetime = None) -> str:
-    # 时间目录会同步到 Windows/SMB：冒号非法，用点分隔更像时间（2026-11-13_11.50）
-    return (ts or dt.datetime.now()).strftime("%Y-%m-%d_%H.%M")
+    # 时间目录会同步到 Windows/SMB：用中文写法最直观，且不含非法字符
+    # 例：2026年11月13日 11点50分
+    t = ts or dt.datetime.now()
+    return f"{t:%Y年%m月%d日 %H点%M分}"
 
 
 def remote_paths(cfg: dict) -> list:
