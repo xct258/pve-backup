@@ -3165,6 +3165,34 @@ def print_help() -> None:
     print(__doc__)
 
 
+def maybe_offer_install() -> None:
+    """首次在未安装位置启动时，询问是否安装到系统路径。"""
+    if str(os.environ.get("PVE_BACKUP_NO_PROMPT", "")).strip() in ("1", "true", "yes"):
+        return
+    try:
+        src = os.path.realpath(sys.argv[0])
+    except OSError:
+        return
+    if src == SELF_PATH or not os.path.isfile(src) or not looks_like_self(src):
+        return
+    if os.path.exists(SELF_PATH):
+        return
+    print("")
+    print(f"检测到正在从 {src} 运行，但尚未安装到 {SELF_PATH}。")
+    print("安装会写入：脚本、/etc/pve-backup.conf、systemd 服务、日志轮转，并启用调度服务。")
+    try:
+        answer = input("是否现在安装？[y/N]: ").strip().lower()
+    except (EOFError, KeyboardInterrupt):
+        print("")
+        return
+    if answer not in ("y", "yes", "是"):
+        print("已跳过，本次只在当前位置运行（之后可随时执行 install 子命令）。")
+        return
+    args = build_install_parser().parse_args([])
+    if do_install(load_conf(), args):
+        print("")
+
+
 def main() -> int:
     if os.geteuid() != 0:
         print("需要 root 权限", file=sys.stderr)
@@ -3175,6 +3203,7 @@ def main() -> int:
         if not require_rclone():
             return 1
         if sys.stdin.isatty() and sys.stdout.isatty():
+            maybe_offer_install()
             interactive_menu()
         else:
             act_status(load_conf())

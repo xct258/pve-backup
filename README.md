@@ -51,6 +51,8 @@ chmod +x pve-backup
 ./pve-backup run
 ```
 
+首次**无参数**运行且尚未安装到 `/usr/local/sbin/pve-backup` 时，会提示是否现在安装（输入 `y` 走上面的 install 流程）。不想被询问可以设置 `PVE_BACKUP_NO_PROMPT=1`。
+
 `install` 做的事：安装脚本、写入 `/etc/pve-backup.conf`、生成 `/etc/logrotate.d/pve-backup`、生成并启动 `pve-backup.service`、注册 rclone remote（给了 `--url/--user/--pass` 时）。
 
 如果不指定 `--url`，需要事先用 `rclone config` 手动建好名为 `webdav` 的 remote。
