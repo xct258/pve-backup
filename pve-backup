@@ -739,7 +739,10 @@ def upload_file(p: dict, path: str, remote_dir: str, allow_delete: bool = True):
     return ("ok", size, dur)
 
 
-RUN_DIR_RE = re.compile(r"^\d{4}-\d{2}-\d{2}_\d{2}:\d{2}$")
+RUN_DIR_RE = re.compile(
+    r"^\d{4}-\d{2}-\d{2}_\d{2}[:.\-]\d{2}$"        # 旧格式：2026-11-13_11:50 / 11-50 / 11.50
+    r"|^\d{4}年\d{2}月\d{2}日\s?\d{2}点\d{2}分$"     # 中文格式：2026年11月13日11点50分
+)
 
 
 def run_dir_name(ts: dt.datetime = None) -> str:
