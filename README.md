@@ -228,7 +228,8 @@ delete_local = 1
 - 保留份数按 VM 计算，`0` 表示不清理
 - 管理入口：全局参数 → 自动快照（总开关、逐台设置、立即执行），虚拟机参数页也能直接改
 - 定时器执行 `pve-backup snapshot`，通过环境变量 `PVE_SNAPSHOT_SCHEDULE` 只处理对应计划
-- 依赖 `qm`（Proxmox VE）；存储需要支持快照（qcow2 / LVM-thin 等），不支持时会在结果里报错
+- 依赖 `qm`（Proxmox VE）；存储需要支持快照（qcow2 / LVM-thin / ZFS / RBD 等）
+- 不支持的虚拟机会明确提示并跳过：LVM、iSCSI 存储，`raw` 磁盘，以及模板；界面里对应 VM 后面标 `⚠ 不支持快照`，设置计划时也会二次确认
 
 手动执行：
 
