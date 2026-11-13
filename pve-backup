@@ -743,7 +743,8 @@ RUN_DIR_RE = re.compile(r"^\d{4}-\d{2}-\d{2}_\d{2}:\d{2}$")
 
 
 def run_dir_name(ts: dt.datetime = None) -> str:
-    return (ts or dt.datetime.now()).strftime("%Y-%m-%d_%H:%M")
+    # 时间目录会同步到 Windows/SMB，冒号在 Windows 上非法（会显示成 8.3 短名）
+    return (ts or dt.datetime.now()).strftime("%Y-%m-%d_%H-%M")
 
 
 def remote_paths(cfg: dict) -> list:
