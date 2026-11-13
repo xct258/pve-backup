@@ -2441,7 +2441,7 @@ def _ui_remotes_view(scr) -> None:
         for r in entries:
             keep = r["keep"] or str(g.get("remote_keep", "") or "").strip()
             state = "" if r["enabled"] != "0" else "（停用）"
-            opts.append(f"{r['path']}    保留 {keep or '不限'}{state}")
+            opts.append(f"{pad(r['path'], 28)} 保留 {keep or '不限'}{state}")
         opts += ["添加远端目录", "返回"]
         idx = _ui_choice(scr, "远端目录（每个目录独立保留）", opts)
         if idx is None or idx == len(opts) - 1:
