@@ -7,7 +7,7 @@ pve-backup —— PVE 多虚拟机备份 + WebDAV 上传（Python 单文件版�
 * 不使用 vzdump 钩子，备份与上传由本脚本顺序编排
 * 支持多台虚拟机，每台可单独设置：模式、压缩、本机保留、远端保留、远端目录、是否删本地、是否 SHA256 校验
 * 使用常驻调度服务（单进程、无 systemd timer），所有虚拟机按全局设定的开始时间统一执行
-* 主菜单支持方向键上下选择（curses），无终端时自动显示状态
+* 全屏仪表盘界面（curses）：顶部服务状态、分组菜单、内嵌弹层与分页视图；无终端时自动降级为状态输出
 * install 子命令自动注册自身、配置、systemd 服务、日志轮转、rclone remote
 
 用法:
@@ -34,6 +34,7 @@ import datetime as dt
 import fcntl
 import glob
 import hashlib
+import io
 import json
 import os
 import re
@@ -434,11 +435,14 @@ def next_run(spec: str, base: dt.datetime = None):
         return None
     if base is None:
         base = dt.datetime.now()
-    out = subprocess.run(
-        ["systemd-analyze", "calendar",
-         f"--base-time={base:%Y-%m-%d %H:%M:%S}", "--iterations=1", expr],
-        capture_output=True, text=True,
-    )
+    try:
+        out = subprocess.run(
+            ["systemd-analyze", "calendar",
+             f"--base-time={base:%Y-%m-%d %H:%M:%S}", "--iterations=1", expr],
+            capture_output=True, text=True,
+        )
+    except OSError:
+        return None
     if out.returncode != 0:
         return None
     m = re.search(r"Next elapse:\s+\w+\s+(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})", out.stdout)
@@ -1762,6 +1766,743 @@ def cmd_daemon() -> int:
 
 
 # ------------------------------------------------------------------ 菜单
+# ------------------------------------------------------------ 全屏仪表盘
+UI_GROUPS = [
+    ("备份", [
+        ("run",     "立即备份（全部虚拟机）", "r"),
+        ("upload",  "补传未上传的备份",       "u"),
+        ("list",    "查看备份明细",           "l"),
+    ]),
+    ("配置", [
+        ("vms",     "虚拟机管理",             "v"),
+        ("global",  "全局参数",               "g"),
+    ]),
+    ("系统", [
+        ("status",  "运行状态",               "s"),
+        ("notify",  "发送测试推送",           "p"),
+        ("service", "服务管理",               "m"),
+        ("quit",    "退出",                   "q"),
+    ]),
+]
+
+_UI_CACHE = {"ts": 0.0, "info": None}
+
+
+def _ui_bust() -> None:
+    _UI_CACHE["ts"] = 0.0
+
+
+def _ui_width(s) -> int:
+    return sum(2 if unicodedata.east_asian_width(c) in "WF" else 1 for c in str(s))
+
+
+def _ui_add(scr, y, x, text, attr=0) -> None:
+    """安全写屏：越界、写最后一格都不会抛异常。"""
+    try:
+        h, w = scr.getmaxyx()
+        if y < 0 or y >= h or x < 0 or x >= w:
+            return
+        scr.addnstr(y, x, str(text), max(0, w - x - 1), attr)
+    except Exception:
+        pass
+
+
+def _ui_box(scr, y, x, h, w, title="", attr=0) -> None:
+    if h < 2 or w < 4:
+        return
+    _ui_add(scr, y, x, "┌" + "─" * (w - 2) + "┐")
+    for i in range(1, h - 1):
+        _ui_add(scr, y + i, x, "│")
+        _ui_add(scr, y + i, x + w - 1, "│")
+    _ui_add(scr, y + h - 1, x, "└" + "─" * (w - 2) + "┘")
+    if title:
+        _ui_add(scr, y, x + 2, f" {title} ", attr | curses.A_BOLD)
+
+
+def _ui_key(scr):
+    try:
+        return scr.get_wch()
+    except AttributeError:
+        return scr.getch()
+    except curses.error:
+        return None
+
+
+def _ui_setup(scr) -> None:
+    scr.keypad(True)
+    try:
+        curses.curs_set(0)
+    except Exception:
+        pass
+    if curses.has_colors():
+        try:
+            curses.start_color()
+            curses.use_default_colors()
+            curses.init_pair(1, curses.COLOR_CYAN, -1)
+            curses.init_pair(2, curses.COLOR_GREEN, -1)
+            curses.init_pair(3, curses.COLOR_RED, -1)
+            curses.init_pair(4, curses.COLOR_YELLOW, -1)
+        except Exception:
+            pass
+
+
+def _ui_color(pair: int):
+    if curses.has_colors():
+        try:
+            return curses.color_pair(pair)
+        except Exception:
+            return 0
+    return 0
+
+
+def _ui_capture(func, *args, **kwargs) -> str:
+    """捕获函数的标准输出，供弹层展示。"""
+    buf = io.StringIO()
+    old = sys.stdout
+    sys.stdout = buf
+    try:
+        func(*args, **kwargs)
+    except Exception as e:  # 捕获异常也要能看到
+        print(f"执行出错: {e}")
+    finally:
+        sys.stdout = old
+    return buf.getvalue()
+
+
+def _ui_suspend(scr, func, *args) -> int:
+    """退出 curses 执行长任务（保持进度输出），结束后返回仪表盘。"""
+    curses.def_prog_mode()
+    curses.endwin()
+    rc = 1
+    try:
+        rc = func(*args) or 0
+    except Exception as e:
+        print(f"\n执行出错: {e}")
+    try:
+        input("\n按回车返回仪表盘...")
+    except (EOFError, KeyboardInterrupt):
+        pass
+    curses.reset_prog_mode()
+    scr.clear()
+    return rc
+
+
+def _ui_msg(scr, title, text, wait="按任意键返回") -> None:
+    lines = str(text).rstrip("\n").split("\n")
+    while True:
+        h, w = scr.getmaxyx()
+        bw = min(w - 4, max(40, max([_ui_width(x) for x in lines] + [_ui_width(title)]) + 8))
+        bh = min(h - 2, len(lines) + 4)
+        y0 = max(0, (h - bh) // 2)
+        x0 = max(0, (w - bw) // 2)
+        scr.erase()
+        _ui_box(scr, y0, x0, bh, bw, title)
+        for i, ln in enumerate(lines[: bh - 3]):
+            _ui_add(scr, y0 + 2 + i, x0 + 2, ln)
+        _ui_add(scr, y0 + bh - 1, x0 + 2, f" {wait} ")
+        scr.refresh()
+        ch = _ui_key(scr)
+        if ch is not None:
+            return
+
+
+def _ui_choice(scr, title, options, default=0):
+    if not options:
+        return None
+    pos = min(max(default, 0), len(options) - 1)
+    while True:
+        h, w = scr.getmaxyx()
+        bw = min(w - 4, max(36, max([_ui_width(o) for o in options] + [_ui_width(title)]) + 8))
+        bh = min(h - 2, len(options) + 4)
+        y0 = max(0, (h - bh) // 2)
+        x0 = max(0, (w - bw) // 2)
+        scr.erase()
+        _ui_box(scr, y0, x0, bh, bw, title)
+        for i, opt in enumerate(options):
+            attr = curses.A_REVERSE if i == pos else 0
+            _ui_add(scr, y0 + 2 + i, x0 + 2,
+                    " " + pad(opt, bw - 6) + " ", attr)
+        _ui_add(scr, y0 + bh - 1, x0 + 2, " ↑/↓ 选择  Enter 确认  q 取消 ")
+        scr.refresh()
+        ch = _ui_key(scr)
+        if isinstance(ch, int):
+            if ch == curses.KEY_UP:
+                pos = (pos - 1) % len(options)
+            elif ch == curses.KEY_DOWN:
+                pos = (pos + 1) % len(options)
+            elif ch in (10, 13, curses.KEY_ENTER):
+                return pos
+            elif ch in (27, ord("q")):
+                return None
+        elif ch in ("k", "j"):
+            pos = (pos + (-1 if ch == "k" else 1)) % len(options)
+        elif ch == "\n":
+            return pos
+        elif ch in ("q", "\x1b"):
+            return None
+
+
+def _ui_input(scr, title, default="", hint=""):
+    buf = str(default)
+    pos = len(buf)
+    while True:
+        h, w = scr.getmaxyx()
+        bw = min(w - 4, max(48, _ui_width(buf) + 8))
+        bh = 6
+        y0 = max(0, (h - bh) // 2)
+        x0 = max(0, (w - bw) // 2)
+        scr.erase()
+        _ui_box(scr, y0, x0, bh, bw, title)
+        if hint:
+            _ui_add(scr, y0 + 1, x0 + 2, hint, curses.A_DIM)
+        _ui_add(scr, y0 + 3, x0 + 2, buf[: bw - 4])
+        try:
+            curses.curs_set(1)
+            scr.move(y0 + 3, min(x0 + 2 + _ui_width(buf[:pos]), w - 2))
+        except Exception:
+            pass
+        _ui_add(scr, y0 + bh - 1, x0 + 2, " Enter 确认  Esc 取消 ")
+        scr.refresh()
+        ch = _ui_key(scr)
+        if isinstance(ch, int):
+            if ch in (10, 13, curses.KEY_ENTER):
+                try:
+                    curses.curs_set(0)
+                except Exception:
+                    pass
+                return buf
+            if ch == 27:
+                try:
+                    curses.curs_set(0)
+                except Exception:
+                    pass
+                return None
+            if ch in (curses.KEY_BACKSPACE, 127, 8):
+                if pos > 0:
+                    buf = buf[: pos - 1] + buf[pos:]
+                    pos -= 1
+            elif ch == curses.KEY_DC:
+                buf = buf[:pos] + buf[pos + 1:]
+            elif ch == curses.KEY_LEFT:
+                pos = max(0, pos - 1)
+            elif ch == curses.KEY_RIGHT:
+                pos = min(len(buf), pos + 1)
+            elif ch == curses.KEY_HOME:
+                pos = 0
+            elif ch == curses.KEY_END:
+                pos = len(buf)
+        elif isinstance(ch, str) and ch.isprintable():
+            buf = buf[:pos] + ch + buf[pos:]
+            pos += 1
+        elif ch == "\x1b":
+            try:
+                curses.curs_set(0)
+            except Exception:
+                pass
+            return None
+
+
+def _ui_confirm(scr, title, yes="是，继续", no="否，取消") -> bool:
+    return _ui_choice(scr, title, [no, yes], default=0) == 1
+
+
+def _ui_pager(scr, title, text) -> None:
+    lines = str(text).rstrip("\n").split("\n") or [""]
+    top = 0
+    while True:
+        h, w = scr.getmaxyx()
+        scr.erase()
+        _ui_box(scr, 0, 0, h, w, title)
+        body = max(1, h - 4)
+        for i, ln in enumerate(lines[top: top + body]):
+            _ui_add(scr, 2 + i, 2, ln)
+        more = "  ↑/↓ 滚动  PgUp/PgDn 翻页  Enter/q 返回 "
+        if top + body < len(lines):
+            more = f" [{top + body}/{len(lines)}] " + more
+        _ui_add(scr, h - 1, 2, more, curses.A_DIM)
+        scr.refresh()
+        ch = _ui_key(scr)
+        if isinstance(ch, int):
+            if ch == curses.KEY_UP:
+                top = max(0, top - 1)
+            elif ch == curses.KEY_DOWN:
+                top = min(max(0, len(lines) - body), top + 1)
+            elif ch == curses.KEY_PPAGE:
+                top = max(0, top - body)
+            elif ch == curses.KEY_NPAGE:
+                top = min(max(0, len(lines) - body), top + body)
+            elif ch == curses.KEY_HOME:
+                top = 0
+            elif ch == curses.KEY_END:
+                top = max(0, len(lines) - body)
+            elif ch in (10, 13, 27, curses.KEY_ENTER):
+                return
+        elif ch in ("q", "\x1b", "\n", "\r"):
+            return
+
+
+def _ui_info() -> dict:
+    now = time.time()
+    if _UI_CACHE["info"] and now - _UI_CACHE["ts"] < 3:
+        return _UI_CACHE["info"]
+    cfg = load_conf()
+    g = cfg["global"]
+    running = run_capture(["systemctl", "is-active", DAEMON_UNIT]).strip() == "active"
+    nxt = next_run(g.get("schedule"))
+    info = {
+        "cfg": cfg,
+        "host": host_label(cfg),
+        "auto": str(g.get("auto_enabled", "1")) == "1",
+        "running": running,
+        "schedule": schedule_text(g.get("schedule")),
+        "next": nxt.strftime("%Y-%m-%d %H:%M") if nxt else "-",
+        "vms": len(cfg["vms"]),
+        "vms_on": len(enabled_vmids(cfg)),
+        "remote": g.get("remote", ""),
+        "paths": g.get("remote_paths", ""),
+        "keep": g.get("remote_keep", ""),
+        "notify_on": g.get("notify_on", ""),
+        "notify_url": g.get("notify_url", ""),
+    }
+    _UI_CACHE.update(ts=now, info=info)
+    return info
+
+
+def _ui_rows() -> list:
+    rows = []
+    for group, items in UI_GROUPS:
+        rows.append({"kind": "group", "label": group})
+        for key, label, hot in items:
+            rows.append({"kind": "item", "key": key, "label": label, "hot": hot})
+    return rows
+
+
+def _ui_first_item(rows) -> int:
+    for i, r in enumerate(rows):
+        if r["kind"] == "item":
+            return i
+    return 0
+
+
+def _ui_move(rows, sel, step) -> int:
+    n = len(rows)
+    i = sel
+    for _ in range(n):
+        i = (i + step) % n
+        if rows[i]["kind"] == "item":
+            return i
+    return sel
+
+
+def _ui_header(info) -> list:
+    g = info["cfg"]["global"]
+    auto = info["auto"]
+    if auto and info["running"]:
+        auto_txt = "✅ 已开启"
+    elif auto:
+        auto_txt = "⚠ 已启用但服务未运行"
+    else:
+        auto_txt = "⏸ 已关闭"
+    svc = "● active" if info["running"] else "○ inactive"
+    push = f"{info['notify_on'] or '-'} · {info['notify_url'] or '未配置'}"
+    lines = [
+        ("主机", info["host"], 0),
+        ("自动备份", f"{auto_txt} · {info['schedule']} · 下次 {info['next']}", 0),
+        ("调度服务", svc, 0),
+        ("虚拟机", f"{info['vms']} 台（启用 {info['vms_on']}）", 0),
+        ("远端", f"{info['remote']} → {info['paths'] or '未配置'} · 保留 {info['keep']}", 0),
+        ("推送", push, 0),
+    ]
+    return lines
+
+
+def _ui_draw_dashboard(scr, rows, sel, msg) -> None:
+    scr.erase()
+    h, w = scr.getmaxyx()
+    if h < 16 or w < 52:
+        _ui_add(scr, 0, 0, "终端窗口太小，请调整到至少 52x16 后重试。")
+        scr.refresh()
+        return
+    info = _ui_info()
+    head = _ui_header(info)
+    hh = len(head) + 2
+    _ui_box(scr, 0, 0, hh, w, "pve-backup · 备份管理")
+    for i, (label, value, attr) in enumerate(head):
+        _ui_add(scr, 1 + i, 2, pad(label, 10), curses.A_BOLD)
+        _ui_add(scr, 1 + i, 2 + 10, value, attr)
+
+    y = hh + 1
+    for i, row in enumerate(rows):
+        if row["kind"] == "group":
+            _ui_add(scr, y, 2, row["label"], curses.A_BOLD | _ui_color(1))
+            y += 1
+            continue
+        selected = i == sel
+        left = ("▸ " if selected else "  ") + row["label"]
+        right = f"[{row['hot']}]"
+        text = " " + pad(left, max(1, w - 8 - _ui_width(right))) + right + " "
+        _ui_add(scr, y, 2, text, curses.A_REVERSE if selected else 0)
+        y += 1
+
+    _ui_add(scr, h - 2, 2, msg or "就绪", _ui_color(4))
+    _ui_add(scr, h - 1, 2,
+            " ↑/↓ 选择   Enter 执行   q 退出   快捷键见右侧方括号 ",
+            curses.A_DIM)
+
+
+def _ui_vm_edit(scr, vmid) -> None:
+    fields = ["mode", "compress", "local_prune",
+              "delete_local", "verify_hash", "enabled"]
+    while True:
+        cfg = load_conf()
+        guests = guest_map()
+        p = target_params(cfg, vmid, guests)
+        opts = [
+            f"备份模式        {p['mode']}",
+            f"压缩算法        {p['compress']}",
+            f"本机保留        {p['local_prune']}",
+            f"上传后删本地    {'是' if p['delete_local'] == '1' else '否'}",
+            f"SHA256 校验     {'是' if p['verify_hash'] == '1' else '否'}",
+            f"启用备份        {'是' if p['enabled'] else '否'}",
+            "完成并返回",
+        ]
+        idx = _ui_choice(scr, f"VM {vmid} · {p['name'] or '-'} 参数", opts)
+        if idx is None or idx == len(opts) - 1:
+            return
+        key = fields[idx]
+        vm = cfg["vms"].setdefault(vmid, {"enabled": "1"})
+        if key == "mode":
+            v = _ui_choice(scr, "备份模式", ["snapshot（快照，不停机）",
+                                             "suspend（短暂挂起）",
+                                             "stop（关机备份）"])
+            if v is not None:
+                vm[key] = ["snapshot", "suspend", "stop"][v]
+        elif key == "compress":
+            v = _ui_choice(scr, "压缩算法", ["zstd", "gzip", "lzo", "0（不压缩）"])
+            if v is not None:
+                vm[key] = ["zstd", "gzip", "lzo", "0"][v]
+        elif key == "local_prune":
+            v = _ui_input(scr, "本机保留策略", vm.get("local_prune", ""),
+                          "如 keep-last=3，留空表示继承全局")
+            if v is not None:
+                vm[key] = v.strip()
+        elif key in ("delete_local", "verify_hash"):
+            v = _ui_choice(scr, "选择值", ["开启", "关闭"],
+                           default=0 if str(vm.get(key, p[key])) == "1" else 1)
+            if v is not None:
+                vm[key] = "1" if v == 0 else "0"
+        elif key == "enabled":
+            v = _ui_choice(scr, "启用这台虚拟机的备份？", ["开启", "关闭"],
+                           default=0 if p["enabled"] else 1)
+            if v is not None:
+                vm[key] = "1" if v == 0 else "0"
+        save_conf(cfg)
+        _ui_capture(sync_service, cfg)
+        _ui_bust()
+
+
+def _ui_vm_view(scr) -> None:
+    sel = 0
+    msg = ""
+    while True:
+        cfg = load_conf()
+        guests = guest_map()
+        vms = sorted(cfg["vms"], key=lambda x: int(x) if x.isdigit() else 0)
+        sel = max(0, min(sel, len(vms) - 1)) if vms else 0
+        scr.erase()
+        h, w = scr.getmaxyx()
+        _ui_box(scr, 0, 0, h, w, "虚拟机备份管理")
+        head = (" " + pad("VMID", 6) + " " + pad("名称", 18) + " "
+                + pad("节点状态", 10) + " " + pad("启用", 6) + " "
+                + pad("模式", 10) + " 压缩")
+        _ui_add(scr, 2, 2, head, curses.A_BOLD)
+        _ui_add(scr, 3, 2, "─" * max(0, w - 4), curses.A_DIM)
+        if not vms:
+            _ui_add(scr, 5, 2, "尚未配置虚拟机，按 a 添加")
+        for i, vmid in enumerate(vms):
+            vm = cfg["vms"][vmid]
+            p = target_params(cfg, vmid, guests)
+            g = guests.get(vmid, {})
+            name = (g.get("name") or "-")[:16]
+            st = g.get("status", "-")
+            on = "是" if str(vm.get("enabled", "1")) != "0" else "否"
+            line = (f" {pad(vmid, 6)} {pad(name, 18)} {pad(st, 10)} {pad(on, 6)} "
+                    f"{pad(p['mode'], 10)} {p['compress']}")
+            attr = curses.A_REVERSE if i == sel else 0
+            _ui_add(scr, 4 + i, 2, pad(line, w - 5), attr)
+        _ui_add(scr, h - 2, 2, msg, _ui_color(4))
+        _ui_add(scr, h - 1, 2,
+                " a 添加   e/Enter 修改   Space 启用/停用   d 移除   q 返回 ",
+                curses.A_DIM)
+        scr.refresh()
+        ch = _ui_key(scr)
+        msg = ""
+        if isinstance(ch, int):
+            if ch == curses.KEY_UP:
+                sel = max(0, sel - 1)
+            elif ch == curses.KEY_DOWN:
+                sel = min(max(0, len(vms) - 1), sel + 1)
+            elif ch in (10, 13, curses.KEY_ENTER) and vms:
+                _ui_vm_edit(scr, vms[sel])
+            elif ch in (27,):
+                return
+            continue
+        if ch in ("q", "\x1b"):
+            return
+        if ch == "a":
+            guests = guest_map()
+            cand = [v for v in sorted(guests, key=lambda x: int(x) if x.isdigit() else 0)
+                    if v not in cfg["vms"]]
+            if not cand:
+                msg = "节点上的虚拟机都已加入备份列表"
+                continue
+            opts = [f"{v}  {guests[v]['name']}" for v in cand] + ["取消"]
+            ci = _ui_choice(scr, "选择要添加的虚拟机", opts)
+            if ci is None or ci == len(opts) - 1:
+                continue
+            vmid = cand[ci]
+            out = _ui_capture(add_vm, cfg, vmid, {})
+            if "已添加" in out:
+                _ui_vm_edit(scr, vmid)
+            else:
+                msg = out.strip().split("\n")[-1] if out.strip() else "添加失败"
+            _ui_bust()
+            continue
+        if not vms:
+            continue
+        vmid = vms[sel]
+        if ch in ("e", "\n", "\r"):
+            _ui_vm_edit(scr, vmid)
+        elif ch == "d":
+            if _ui_confirm(scr, f"从备份列表移除 VM {vmid}？（备份文件不删）"):
+                _ui_capture(remove_vm, cfg, vmid)
+                _ui_bust()
+                msg = f"已移除 VM {vmid}"
+        elif ch == " ":
+            vm = cfg["vms"][vmid]
+            vm["enabled"] = "0" if str(vm.get("enabled", "1")) != "0" else "1"
+            save_conf(cfg)
+            _ui_capture(sync_service, cfg)
+            _ui_bust()
+            msg = f"VM {vmid} 已{'启用' if vm['enabled'] == '1' else '停用'}"
+
+
+def _ui_global_view(scr) -> None:
+    while True:
+        cfg = load_conf()
+        g = cfg["global"]
+        opts = [
+            f"调度时间        {schedule_text(g.get('schedule'))}",
+            f"备份模式        {g.get('mode')}",
+            f"压缩算法        {g.get('compress')}",
+            f"本机保留        {g.get('local_prune')}",
+            f"远端保留份数    {g.get('remote_keep')}",
+            f"远端路径        {g.get('remote_paths')}",
+            f"主机标识        {g.get('host_name') or '(系统主机名)'}",
+            f"推送时机        {g.get('notify_on')}",
+            f"推送地址        {g.get('notify_url')}",
+            "返回",
+        ]
+        idx = _ui_choice(scr, "全局参数", opts)
+        if idx is None or idx == len(opts) - 1:
+            return
+        if idx == 0:
+            v = _ui_input(scr, "调度时间", g.get("schedule", ""),
+                          "daily 02:30 / weekly sun 03:00 / monthly 1 00:00")
+            if v is not None:
+                v = v.strip()
+                try:
+                    normalize_schedule(v)
+                except ValueError as e:
+                    _ui_msg(scr, "格式错误", str(e))
+                    continue
+                g["schedule"] = v
+        elif idx == 1:
+            v = _ui_choice(scr, "备份模式", ["snapshot", "suspend", "stop"],
+                           default=["snapshot", "suspend", "stop"].index(
+                               g.get("mode", "snapshot")) if g.get("mode") in
+                           ("snapshot", "suspend", "stop") else 0)
+            if v is not None:
+                g["mode"] = ["snapshot", "suspend", "stop"][v]
+        elif idx == 2:
+            v = _ui_choice(scr, "压缩算法", ["zstd", "gzip", "lzo", "0"])
+            if v is not None:
+                g["compress"] = ["zstd", "gzip", "lzo", "0"][v]
+        elif idx == 3:
+            v = _ui_input(scr, "本机保留策略", g.get("local_prune", ""),
+                          "如 keep-last=3 / keep-daily=7")
+            if v is not None:
+                g["local_prune"] = v.strip()
+        elif idx == 4:
+            v = _ui_input(scr, "远端保留份数", g.get("remote_keep", ""),
+                          "保留最新 N 个时间目录")
+            if v is not None and v.strip().isdigit():
+                g["remote_keep"] = v.strip()
+        elif idx == 5:
+            v = _ui_input(scr, "远端路径", g.get("remote_paths", ""),
+                          "多个用逗号分隔，如 cloud/pve-backup, nas/pve-backup")
+            if v is not None:
+                g["remote_paths"] = v.strip()
+        elif idx == 6:
+            v = _ui_input(scr, "主机标识", g.get("host_name", ""),
+                          "留空使用系统主机名")
+            if v is not None:
+                g["host_name"] = v.strip()
+        elif idx == 7:
+            v = _ui_choice(scr, "推送时机", ["always（每次）", "failure（仅失败）",
+                                             "never（关闭）"])
+            if v is not None:
+                g["notify_on"] = ["always", "failure", "never"][v]
+        elif idx == 8:
+            v = _ui_input(scr, "推送地址", g.get("notify_url", ""),
+                          "push-server 地址，留空关闭推送")
+            if v is not None:
+                g["notify_url"] = v.strip()
+        save_conf(cfg)
+        _ui_bust()
+
+
+def _ui_service_view(scr) -> None:
+    while True:
+        info = _ui_info()
+        cfg = info["cfg"]
+        auto = info["auto"]
+        opts = [
+            "关闭自动备份" if auto else "开启自动备份",
+            "重新注册备份服务",
+            "重置调度状态",
+            "卸载备份服务",
+            "返回",
+        ]
+        idx = _ui_choice(scr, f"服务管理 · 当前{'已开启' if auto else '已关闭'}", opts)
+        if idx is None or idx == 4:
+            return
+        if idx == 0:
+            cfg["global"]["auto_enabled"] = "0" if auto else "1"
+            save_conf(cfg)
+            _ui_capture(sync_service, cfg)
+            _ui_bust()
+            _ui_msg(scr, "已保存", "自动备份已关闭（手动备份仍可用）" if auto
+                    else "自动备份已开启（调度服务常驻运行）")
+        elif idx == 1:
+            out = _ui_capture(do_install, cfg, argparse.Namespace(
+                url=None, user=None, passwd=None, force=True, no_timer=False,
+                vmid=None, preserve_state=True))
+            _ui_bust()
+            _ui_pager(scr, "重新注册服务", out)
+        elif idx == 2:
+            out = _ui_capture(do_reset)
+            _ui_bust()
+            _ui_pager(scr, "重置调度状态", out)
+        elif idx == 3:
+            if _ui_confirm(scr, "确认卸载备份服务？配置和备份文件会保留"):
+                out = _ui_capture(do_uninstall)
+                _ui_bust()
+                _ui_pager(scr, "卸载结果", out)
+
+
+def _ui_action(scr, key, info) -> tuple:
+    cfg = info["cfg"]
+    if key == "quit":
+        return "", True
+    if key == "run":
+        if not info["vms_on"]:
+            _ui_msg(scr, "无法备份", "没有已启用的虚拟机，请先在「虚拟机管理」中添加")
+            return "", False
+        if not _ui_confirm(scr, f"立即备份 {info['vms_on']} 台虚拟机？"):
+            return "已取消", False
+        rc = _ui_suspend(scr, act_run, load_conf())
+        _ui_bust()
+        return f"备份结束（退出码 {rc}）", False
+    if key == "upload":
+        if not _ui_confirm(scr, "补传本地未上传的备份？"):
+            return "已取消", False
+        rc = _ui_suspend(scr, act_upload, load_conf())
+        _ui_bust()
+        return f"补传结束（退出码 {rc}）", False
+    if key == "list":
+        text = _ui_capture(act_list, load_conf())
+        _ui_pager(scr, "本地 / 远端备份明细", text)
+        return "", False
+    if key == "status":
+        text = _ui_capture(act_status, load_conf())
+        _ui_pager(scr, "运行状态", text)
+        return "", False
+    if key == "notify":
+        text = _ui_capture(push_notify, cfg, "info",
+                           "**测试推送**：来自 pve-backup 仪表盘 🎉",
+                           "PVE 备份 · 测试推送")
+        _ui_pager(scr, "推送结果", text)
+        return "推送测试完成", False
+    if key == "vms":
+        _ui_vm_view(scr)
+        _ui_bust()
+        return "", False
+    if key == "global":
+        _ui_global_view(scr)
+        _ui_bust()
+        return "", False
+    if key == "service":
+        _ui_service_view(scr)
+        _ui_bust()
+        return "", False
+    return "", False
+
+
+def _ui_dashboard() -> None:
+    if curses is None or not (sys.stdin.isatty() and sys.stdout.isatty()):
+        plain_menu()
+        return
+
+    def _loop(scr):
+        _ui_setup(scr)
+        rows = _ui_rows()
+        sel = _ui_first_item(rows)
+        msg = ""
+        while True:
+            rows = _ui_rows()
+            _ui_draw_dashboard(scr, rows, sel, msg)
+            scr.refresh()
+            ch = _ui_key(scr)
+            msg = ""
+            if isinstance(ch, int):
+                if ch == curses.KEY_UP:
+                    sel = _ui_move(rows, sel, -1)
+                elif ch == curses.KEY_DOWN:
+                    sel = _ui_move(rows, sel, 1)
+                elif ch in (curses.KEY_RESIZE,):
+                    continue
+                elif ch in (10, 13, curses.KEY_ENTER):
+                    key = rows[sel]["key"]
+                    msg, quit_now = _ui_action(scr, key, _ui_info())
+                    if quit_now:
+                        return
+                elif ch in (27,):
+                    return
+                continue
+            if ch in ("q", "\x1b"):
+                return
+            if ch in ("j", "k"):
+                sel = _ui_move(rows, sel, 1 if ch == "j" else -1)
+                continue
+            if ch == "\n":
+                key = rows[sel]["key"]
+                msg, quit_now = _ui_action(scr, key, _ui_info())
+                if quit_now:
+                    return
+                continue
+            hot = {r["hot"]: r["key"] for r in rows if r["kind"] == "item"}
+            if ch in hot:
+                msg, quit_now = _ui_action(scr, hot[ch], _ui_info())
+                if quit_now:
+                    return
+
+    try:
+        curses.wrapper(_loop)
+    except KeyboardInterrupt:
+        pass
+
+
 ITEMS = [
     ("status",  "查看自动备份状态"),
     ("manual",  "手动备份（执行 / 补传）"),
@@ -1864,22 +2605,8 @@ def _dispatch(key: str, cfg: dict) -> None:
 
 
 def interactive_menu() -> None:
-    while True:
-        idx = pick("PVE 备份管理", [label for _, label in ITEMS])
-        if idx is None:
-            break
-        key = ITEMS[idx][0]
-        if key == "quit":
-            break
-        cfg = load_conf()
-        try:
-            _dispatch(key, cfg)
-        except Exception as e:
-            print(f"\n执行出错: {e}")
-        try:
-            input("\n按回车返回菜单...")
-        except (EOFError, KeyboardInterrupt):
-            break
+    """有 TTY 时进入全屏仪表盘，否则退回纯文本菜单。"""
+    _ui_dashboard()
 
 
 def plain_menu() -> None:
