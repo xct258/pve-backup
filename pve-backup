@@ -17,6 +17,7 @@ pve-backup —— PVE 多虚拟机备份 + WebDAV 上传（Python 单文件版�
   pve-backup upload              只补传本地未上传的备份
   pve-backup list                列出本地/远端备份明细
   pve-backup vms                 列出已配置的虚拟机及其参数
+  pve-backup notify [文本]       发送一条测试推送
   pve-backup add <vmid> [选项]   添加虚拟机
   pve-backup edit <vmid> [选项]  修改虚拟机参数
   pve-backup remove <vmid>       移除虚拟机
@@ -44,6 +45,8 @@ import subprocess
 import sys
 import time
 import unicodedata
+import urllib.error
+import urllib.request
 
 try:
     import curses
@@ -95,6 +98,11 @@ GLOBAL_DEFAULTS = {
     "auto_enabled": "1",
     "rclone_retries": "5",
     "rclone_timeout": "10m",
+    # 推送通知（push-server）
+    "notify_url": "https://push-server.o1-1.xct258.top",
+    "notify_topic": "server/pve-backup",
+    "notify_on": "always",
+    "notify_timeout": "10",
 }
 
 # 每台虚拟机可覆盖的字段（空字符串表示继承全局）
@@ -253,6 +261,90 @@ def notify_daemon() -> None:
             os.kill(int(pid), signal.SIGHUP)
         except OSError:
             pass
+
+
+# ------------------------------------------------------------ 推送通知
+def push_notify(cfg: dict, status: str, message: str,
+                title: str = "PVE 备份") -> bool:
+    """把运行结果推送到 push-server（POST /api/push，无需鉴权）。
+
+    status: ok / warn / error / info
+    推送失败只记日志，不影响备份结果。
+    """
+    g = cfg.get("global", {})
+    url = str(g.get("notify_url") or "").strip()
+    if not url:
+        return False
+    base = url.rstrip("/")
+    if not base.endswith("/api/push"):
+        base += "/api/push"
+
+    payload = {
+        "server_name": host_label(cfg),
+        "category": "service",
+        "topic": str(g.get("notify_topic") or "server/pve-backup"),
+        "title": title or "PVE 备份",
+        "message": message,
+        "status": status if status in ("ok", "warn", "error", "info") else "info",
+        "push_to_mqtt": True,
+        "msg_type": "markdown",
+        "mode": "append",
+    }
+    data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+    req = urllib.request.Request(
+        base, data=data, method="POST",
+        headers={"Content-Type": "application/json; charset=utf-8"})
+    try:
+        timeout = float(g.get("notify_timeout") or 10)
+    except ValueError:
+        timeout = 10
+
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            body = resp.read().decode("utf-8", "replace")
+            try:
+                obj = json.loads(body)
+            except ValueError:
+                obj = {}
+            ok = resp.status == 200 and int(obj.get("code", 200)) == 200
+            say(f"  [推送] {'已发送' if ok else '服务返回异常'}: {body[:200]}")
+            return ok
+    except (urllib.error.URLError, OSError, ValueError) as e:
+        say(f"  [推送] 发送失败: {e}")
+        return False
+
+
+def notify_allowed(cfg: dict, failed: bool) -> bool:
+    on = str(cfg.get("global", {}).get("notify_on", "always")).strip().lower()
+    if on == "never":
+        return False
+    if on == "failure" and not failed:
+        return False
+    return bool(str(cfg.get("global", {}).get("notify_url") or "").strip())
+
+
+def notify_run_summary(cfg: dict, rows: list, run_dirs: list,
+                       total_sec: int, failed: bool) -> None:
+    if not notify_allowed(cfg, failed):
+        return
+    ok_n = sum(1 for r in rows if r[5] == "ok")
+    fail_n = sum(1 for r in rows if r[5] in ("failed", "backup-failed"))
+    size = sum(r[3] for r in rows if r[5] == "ok")
+    lines = [
+        f"**主机**：{host_label(cfg)}",
+        f"**时间**：{dt.datetime.now():%Y-%m-%d %H:%M:%S}",
+        f"**耗时**：{total_sec}s",
+        f"**虚拟机**：{len(rows)} 台｜成功 {ok_n}｜失败 {fail_n}",
+        f"**上传**：{hsize(size)}",
+        "**远端**：" + "、".join(f"`{d}`" for d in run_dirs),
+        "",
+        "| VMID | 名称 | 文件 | 大小 | 结果 |",
+        "| --- | --- | --- | --- | --- |",
+    ]
+    for vmid, name, base, fsize, _dur, st in rows:
+        lines.append(f"| {vmid} | {name or '-'} | {base} | {hsize(fsize)} | {st} |")
+    push_notify(cfg, "error" if failed else "ok", "\n".join(lines),
+                title=f"PVE 备份 · {host_label(cfg)}")
 
 
 def run_stream(cmd, to_log: bool = False, quiet: bool = False) -> int:
@@ -919,6 +1011,7 @@ def act_run(cfg: dict, only: str = None) -> int:
             say("  状态: ❌ 存在失败（可执行 upload 重试）")
         else:
             say("  状态: ✅ 全部成功")
+        notify_run_summary(cfg, rows, run_dirs, total, bool(overall_fail))
         section(f"结束 {dt.datetime.now():%Y-%m-%d %H:%M:%S}")
         return 1 if overall_fail else 0
     finally:
@@ -979,6 +1072,16 @@ def act_upload(cfg: dict) -> int:
         if not any_file:
             say("  本地没有可上传的备份")
         say("  结果: ✅ 全部就绪" if fail == 0 else "  结果: ❌ 部分上传失败")
+        if notify_allowed(cfg, bool(fail)):
+            result = ("本地无可上传文件" if not any_file
+                      else ("部分上传失败" if fail else "全部就绪"))
+            push_notify(
+                cfg, "error" if fail else "ok",
+                f"**主机**：{host_label(cfg)}\n"
+                f"**时间**：{dt.datetime.now():%Y-%m-%d %H:%M:%S}\n"
+                f"**动作**：补传本地未上传备份\n"
+                f"**结果**：{result}",
+                title=f"PVE 备份补传 · {host_label(cfg)}")
         return 1 if fail else 0
     finally:
         try:
@@ -1875,6 +1978,10 @@ def main() -> int:
     if cmd == "vms":
         show_vm_table(cfg)
         return 0
+    if cmd == "notify":
+        msg = " ".join(rest) if rest else "这是一条来自 pve-backup 的测试消息 🎉"
+        ok = push_notify(cfg, "info", msg, title="PVE 备份 · 测试推送")
+        return 0 if ok else 1
     if cmd == "add":
         a = parse_vm_options(rest)
         add_vm(cfg, a["vmid"], vm_values_from_args(a), overwrite=False)

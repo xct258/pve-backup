@@ -17,6 +17,12 @@ auto_enabled = 1
 rclone_retries = 5
 rclone_timeout = 10m
 
+# 推送通知（push-server）
+notify_url = https://push-server.o1-1.xct258.top
+notify_topic = server/pve-backup
+notify_on = always
+notify_timeout = 10
+
 [vm:100]
 enabled = 1
 mode = snapshot

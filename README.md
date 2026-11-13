@@ -14,6 +14,7 @@ Proxmox VE 多虚拟机备份 + WebDAV 远传工具（单文件 Python，无需�
 - **幂等补传**：`upload` 子命令扫描本地未上传的归档，大小一致则跳过，适合失败后重试
 - **交互菜单**：`pve-backup` 无参数启动 curses 菜单（方向键选择）；无终端时自动降级为状态输出
 - **自检查**：`status` 展示调度时间、下次执行、远端连通性、虚拟机表与最近日志
+- **完成推送**：可选把每次运行结果推送到 [push-server](https://push-server.o1-1.xct258.top)（`POST /api/push`），支持只在失败时推送
 
 ## 环境要求
 
@@ -64,6 +65,7 @@ chmod +x pve-backup
 | `pve-backup upload` | 只补传本地未上传的归档（幂等） |
 | `pve-backup list` | 列出本地与远端备份明细 |
 | `pve-backup vms` | 列出配置中的虚拟机及参数 |
+| `pve-backup notify [文本]` | 发送一条测试推送 |
 | `pve-backup add <vmid> [选项]` | 添加虚拟机 |
 | `pve-backup edit <vmid> [选项]` | 修改虚拟机参数 |
 | `pve-backup remove <vmid>` | 从配置移除虚拟机（不删备份文件） |
@@ -96,6 +98,12 @@ schedule = monthly 1 00:00      # 调度时间
 auto_enabled = 1                # 自动调度开关
 rclone_retries = 5
 rclone_timeout = 10m
+
+# 推送通知（push-server）
+notify_url = https://push-server.o1-1.xct258.top
+notify_topic = server/pve-backup
+notify_on = always              # always / failure / never
+notify_timeout = 10
 
 [vm:100]
 enabled = 1
@@ -133,6 +141,38 @@ delete_local = 1
 | `/var/lib/pve-backup/state.json` | 调度状态（上次运行时间） |
 | `/run/pve-backup.lock` | 运行锁 |
 | `/var/lib/vz/dump` | 本地归档（`vzdump-*.vma.*` / `vzdump-*.tar.*`） |
+
+## 推送通知
+
+每次 `run`（含调度触发）结束后，以及每次 `upload` 结束后，可向 push-server 推送一条汇总消息。
+
+| 配置项 | 默认 | 说明 |
+|---|---|---|
+| `notify_url` | `https://push-server.o1-1.xct258.top` | 推送地址，可写根地址或完整的 `/api/push`；留空关闭 |
+| `notify_topic` | `server/pve-backup` | push-server 的 `topic`，用于客户端分类订阅 |
+| `notify_on` | `always` | `always` 全部推送 / `failure` 仅失败时推送 / `never` 关闭 |
+| `notify_timeout` | `10` | 请求超时（秒） |
+
+对应关系：`server_name` = `host_name`（为空时取系统主机名），`category` = `service`，`title` = `PVE 备份 · <主机>`，`status` = `ok` / `error`，`push_to_mqtt` = `true`，`msg_type` = `markdown`。正文示例：
+
+```markdown
+**主机**：pve-node1
+**时间**：2026-11-13 02:00:12
+**耗时**：312s
+**虚拟机**：2 台｜成功 2｜失败 0
+**上传**：3.4GiB
+**远端**：`cloud/pve-backup/pve-node1/20261113-020003`
+
+| VMID | 名称 | 文件 | 大小 | 结果 |
+| --- | --- | --- | --- | --- |
+| 100 | web | vzdump-qemu-100-2026_11_13-02_00_03.vma.zst | 2.1GiB | ok |
+```
+
+推送失败（网络、超时、服务端 5xx）只会写入日志 `[推送] 发送失败: ...`，不影响备份退出码。验证通道：
+
+```bash
+pve-backup notify "测试消息"
+```
 
 ## 常见问题
 
