@@ -1,0 +1,1915 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+# MARKER: pve-backup-single-file-v1
+"""
+pve-backup —— PVE 多虚拟机备份 + WebDAV 上传（Python 单文件版）
+
+* 不使用 vzdump 钩子，备份与上传由本脚本顺序编排
+* 支持多台虚拟机，每台可单独设置：模式、压缩、本机保留、远端保留、远端目录、是否删本地、是否 SHA256 校验
+* 使用常驻调度服务（单进程、无 systemd timer），所有虚拟机按全局设定的开始时间统一执行
+* 主菜单支持方向键上下选择（curses），无终端时自动显示状态
+* install 子命令自动注册自身、配置、systemd 服务、日志轮转、rclone remote
+
+用法:
+  pve-backup                     交互式菜单
+  pve-backup status              查看自动备份状态
+  pve-backup run [vmid]          备份（不指定 vmid 则备份全部已启用虚拟机）
+  pve-backup upload              只补传本地未上传的备份
+  pve-backup list                列出本地/远端备份明细
+  pve-backup vms                 列出已配置的虚拟机及其参数
+  pve-backup add <vmid> [选项]   添加虚拟机
+  pve-backup edit <vmid> [选项]  修改虚拟机参数
+  pve-backup remove <vmid>       移除虚拟机
+  pve-backup config              打印当前配置
+  pve-backup install [选项]      自动注册备份服务
+  pve-backup reset               清空调度状态并重启服务
+  pve-backup uninstall           卸载备份服务
+  pve-backup daemon              前台运行调度服务（由 systemd 调用）
+"""
+
+import argparse
+import configparser
+import datetime as dt
+import fcntl
+import glob
+import hashlib
+import json
+import os
+import re
+import select
+import shutil
+import signal
+import socket
+import subprocess
+import sys
+import time
+import unicodedata
+
+try:
+    import curses
+except ImportError:
+    curses = None
+
+SELF_PATH = "/usr/local/sbin/pve-backup"
+CONF = "/etc/pve-backup.conf"
+LOG = "/var/log/pve-backup.log"
+LOCK = "/run/pve-backup.lock"
+MARKER = "/run/pve-backup.marker"
+SERVICE_NAME = "pve-backup-webdav.service"
+TIMER_NAME = "pve-backup-webdav.timer"
+UNIT_DIR = "/etc/systemd/system"
+LOGROTATE_FILE = "/etc/logrotate.d/pve-backup"
+STATE_DIR = "/var/lib/pve-backup"
+STATE_FILE = os.path.join(STATE_DIR, "state.json")
+RCLONE_CONFIG = "/root/.config/rclone/rclone.conf"
+RCLONE = shutil.which("rclone") or "rclone"
+
+RCLONE_HINT = (
+    "错误: 未找到 rclone。\n"
+    "请先安装后再运行：\n"
+    "  apt update && apt install -y rclone\n"
+    "或使用官方安装脚本：\n"
+    "  curl https://rclone.org/install.sh | sudo bash"
+)
+
+# 固定配置（不可在界面/命令行修改）
+FIXED_SCHEDULE = "monthly 1 00:00"
+FIXED_STORAGE = "local"
+FIXED_DUMPDIR = "/var/lib/vz/dump"
+FIXED_REMOTE = "webdav"
+
+GLOBAL_DEFAULTS = {
+    "storage": FIXED_STORAGE,
+    "dumpdir": FIXED_DUMPDIR,
+    "mode": "snapshot",
+    "compress": "zstd",
+    "local_prune": "keep-last=3",
+    "remote": FIXED_REMOTE,
+    "host_name": "",
+    "remote_paths": "",
+    "remote_subdir": "",
+    "remote_keep": "3",
+    "delete_local": "0",
+    "verify_hash": "0",
+    "schedule": FIXED_SCHEDULE,
+    "auto_enabled": "1",
+    "rclone_retries": "5",
+    "rclone_timeout": "10m",
+}
+
+# 每台虚拟机可覆盖的字段（空字符串表示继承全局）
+VM_FIELDS = ["enabled", "mode", "compress", "local_prune",
+             "delete_local", "verify_hash"]
+
+LEGACY_MAP = {
+    "STORAGE": "storage", "DUMPDIR": "dumpdir", "BACKUP_MODE": "mode",
+    "COMPRESS": "compress", "LOCAL_PRUNE": "local_prune",
+    "RCLONE_REMOTE": "remote", "REMOTE_SUBDIR": "remote_subdir",
+    "DELETE_LOCAL": "delete_local",
+    "VERIFY_HASH": "verify_hash", "SCHEDULE": "schedule",
+    "RCLONE_RETRIES": "rclone_retries", "RCLONE_TIMEOUT": "rclone_timeout",
+}
+
+LOGGING = False
+LINE = "─" * 60
+
+# VM 备份为 .vma.*，容器备份为 .tar.*
+ARCHIVE_PATTERNS = ["vzdump-*.vma.*", "vzdump-*.tar.*"]
+
+
+# ------------------------------------------------------------------ 基础
+def log(msg: str) -> None:
+    try:
+        with open(LOG, "a", encoding="utf-8") as f:
+            f.write(f"{dt.datetime.now():%Y-%m-%d %H:%M:%S} {msg}\n")
+    except OSError:
+        pass
+
+
+def say(msg: str = "") -> None:
+    print(msg)
+    if LOGGING and msg.strip():
+        log(msg)
+
+
+def section(title: str) -> None:
+    say("")
+    say(LINE)
+    say(f" {title}")
+    say(LINE)
+
+
+def pad(s, width: int) -> str:
+    s = str(s)
+    d = sum(2 if unicodedata.east_asian_width(c) in "WF" else 1 for c in s)
+    return s + " " * max(0, width - d)
+
+
+def hsize(n) -> str:
+    try:
+        n = float(n)
+    except (TypeError, ValueError):
+        return "0B"
+    for unit in ("B", "KiB", "MiB", "GiB", "TiB"):
+        if n < 1024 or unit == "TiB":
+            return f"{n:.0f}{unit}" if unit == "B" else f"{n:.1f}{unit}"
+        n /= 1024
+    return f"{n:.1f}TiB"
+
+
+def run_capture(cmd) -> str:
+    try:
+        return subprocess.run(cmd, capture_output=True, text=True).stdout.strip()
+    except Exception:
+        return ""
+
+
+def rclone_available() -> bool:
+    return shutil.which("rclone") is not None
+
+
+def require_rclone() -> bool:
+    global RCLONE
+    path = shutil.which("rclone")
+    if path:
+        RCLONE = path
+        return True
+    print(RCLONE_HINT, file=sys.stderr)
+    log("错误: 未找到 rclone")
+    return False
+
+
+def rclone_config_get(remote: str, key: str) -> str:
+    import configparser
+    cp = configparser.ConfigParser(interpolation=None)
+    try:
+        cp.read(RCLONE_CONFIG)
+    except configparser.Error:
+        return ""
+    if cp.has_section(remote):
+        return cp.get(remote, key, fallback="")
+    return ""
+
+
+def configure_webdav(cfg: dict) -> None:
+    if not require_rclone():
+        return
+    import getpass
+
+    remote = cfg["global"].get("remote", "webdav")
+    cur_url = rclone_config_get(remote, "url")
+    cur_user = rclone_config_get(remote, "user")
+    cur_pass = rclone_config_get(remote, "pass")
+
+    print("")
+    print("WebDAV 连接设置（凭证保存在 /root/.config/rclone/rclone.conf）")
+    print("地址示例: http://192.168.50.4:5244/dav  （只填到 /dav，不带备份子目录）")
+    try:
+        url = input(f"地址 [{cur_url}]: ").strip() or cur_url
+        user = input(f"用户名 [{cur_user}]: ").strip() or cur_user
+        pwd = getpass.getpass("密码（留空保持当前）: ")
+    except (EOFError, KeyboardInterrupt):
+        return
+
+    if not url or not user:
+        print("地址和用户名不能为空")
+        return
+
+    if pwd:
+        obscured = subprocess.run([RCLONE, "obscure", pwd],
+                                  capture_output=True, text=True).stdout.strip()
+    else:
+        obscured = cur_pass
+
+    cmd = [RCLONE, "config", "create", remote, "webdav",
+           f"url={url}", "vendor=other", f"user={user}",
+           "--config", RCLONE_CONFIG]
+    if obscured:
+        cmd.append(f"pass={obscured}")
+
+    rc = subprocess.run(cmd, capture_output=True, text=True).returncode
+    if rc != 0:
+        print("保存失败，请检查 rclone 配置")
+        return
+
+    print("已保存，正在测试连接...")
+    test = subprocess.run([RCLONE, "lsd", f"{remote}:"], capture_output=True, text=True)
+    if test.returncode == 0:
+        print("连接成功 ✅")
+        log("WebDAV 凭证已更新，连接成功")
+    else:
+        msg = (test.stderr or test.stdout).strip().splitlines()
+        print("连接失败 ❌")
+        if msg:
+            print("  " + msg[-1][:200])
+        log("WebDAV 凭证已更新，但连接失败")
+
+
+def notify_daemon() -> None:
+    """配置保存后唤醒调度服务，让它立即重算下次时间。"""
+    pid = run_capture(["systemctl", "show", "-p", "MainPID", "--value", DAEMON_UNIT])
+    if pid.isdigit() and int(pid) > 0:
+        try:
+            os.kill(int(pid), signal.SIGHUP)
+        except OSError:
+            pass
+
+
+def run_stream(cmd, to_log: bool = False, quiet: bool = False) -> int:
+    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                            text=True, bufsize=1, errors="replace")
+    logf = open(LOG, "a", encoding="utf-8") if to_log else None
+    try:
+        for line in proc.stdout:
+            if not quiet:
+                print(line, end="", flush=True)
+            if logf:
+                logf.write(line)
+        rc = proc.wait()
+    finally:
+        if logf:
+            logf.close()
+    return rc
+
+
+def acquire_lock(timeout: int = 3600):
+    f = open(LOCK, "w")
+    start = time.time()
+    while True:
+        try:
+            fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            return f
+        except BlockingIOError:
+            if time.time() - start > timeout:
+                f.close()
+                return None
+            time.sleep(1)
+
+
+def archive_files(dumpdir: str, vmid: str = None) -> list:
+    out = set()
+    for pat in ARCHIVE_PATTERNS:
+        if vmid is not None:
+            pat = pat.replace("vzdump-*", f"vzdump-*-{vmid}-*", 1)
+        out.update(glob.glob(os.path.join(dumpdir, pat)))
+    return sorted(out)
+
+
+# ------------------------------------------------------------------ 备份计划
+DAY_MAP = {"mon": "Mon", "tue": "Tue", "wed": "Wed", "thu": "Thu",
+           "fri": "Fri", "sat": "Sat", "sun": "Sun"}
+
+
+def normalize_schedule(spec: str) -> str:
+    """把友好写法转换为 systemd OnCalendar；也接受原生 OnCalendar。"""
+    spec = (spec or "").strip()
+    if not spec:
+        return ""
+
+    def norm_time(t: str) -> str:
+        return t if t.count(":") >= 2 else (t + ":00" if t.count(":") == 1 else t)
+
+    parts = spec.split()
+    head = parts[0].lower()
+    if head == "daily" and len(parts) == 2:
+        return f"*-*-* {norm_time(parts[1])}"
+    if head == "weekly" and len(parts) == 3:
+        day = DAY_MAP.get(parts[1].lower()[:3])
+        if not day:
+            raise ValueError(f"无效的星期: {parts[1]}（可用 mon/tue/wed/thu/fri/sat/sun）")
+        return f"{day} *-*-* {norm_time(parts[2])}"
+    if head == "monthly" and len(parts) == 3:
+        if not parts[1].isdigit() or not 1 <= int(parts[1]) <= 31:
+            raise ValueError(f"无效的日期: {parts[1]}（1-31）")
+        return f"*-*-{int(parts[1]):02d} {norm_time(parts[2])}"
+    return spec
+
+
+def schedule_valid(spec: str) -> bool:
+    if not spec:
+        return True
+    return subprocess.run(["systemd-analyze", "calendar", spec],
+                          capture_output=True).returncode == 0
+
+
+def next_run(spec: str, base: dt.datetime = None):
+    """计算 base 之后的下一次触发时间。"""
+    try:
+        expr = normalize_schedule(spec)
+    except ValueError:
+        return None
+    if not expr:
+        return None
+    if base is None:
+        base = dt.datetime.now()
+    out = subprocess.run(
+        ["systemd-analyze", "calendar",
+         f"--base-time={base:%Y-%m-%d %H:%M:%S}", "--iterations=1", expr],
+        capture_output=True, text=True,
+    )
+    if out.returncode != 0:
+        return None
+    m = re.search(r"Next elapse:\s+\w+\s+(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})", out.stdout)
+    if not m:
+        return None
+    return dt.datetime.strptime(m.group(1), "%Y-%m-%d %H:%M:%S")
+
+
+def _state_dt(v):
+    if isinstance(v, dict):
+        vals = [x for x in v.values() if isinstance(x, str) and x]
+        return max(vals) if vals else None
+    return v if isinstance(v, str) and v else None
+
+
+def load_state() -> dict:
+    raw = {}
+    try:
+        with open(STATE_FILE, encoding="utf-8") as f:
+            raw = json.load(f)
+    except (OSError, ValueError):
+        raw = {}
+    if not isinstance(raw, dict):
+        raw = {}
+    if "last" in raw or "ran" in raw:
+        return {"last": _state_dt(raw.get("last")), "ran": _state_dt(raw.get("ran"))}
+    # 兼容旧的按 VM / 旧结构
+    return {"last": _state_dt(raw), "ran": None}
+
+
+def save_state(state: dict) -> None:
+    try:
+        os.makedirs(STATE_DIR, exist_ok=True)
+        tmp = STATE_FILE + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump({"last": state.get("last"), "ran": state.get("ran")},
+                      f, ensure_ascii=False, indent=2)
+        os.replace(tmp, STATE_FILE)
+    except OSError:
+        pass
+
+
+def parse_iso(s):
+    try:
+        return dt.datetime.fromisoformat(s)
+    except (TypeError, ValueError):
+        return None
+
+
+# ------------------------------------------------------------------ 配置
+def guest_map() -> dict:
+    node = run_capture(["hostname"]) or "pve"
+    m = {}
+    for kind, path in (("qemu", f"/nodes/{node}/qemu"), ("lxc", f"/nodes/{node}/lxc")):
+        raw = run_capture(["pvesh", "get", path, "--output-format", "json"])
+        try:
+            items = json.loads(raw or "[]")
+        except Exception:
+            items = []
+        for it in items:
+            m[str(it.get("vmid", ""))] = {
+                "name": it.get("name", "-"),
+                "status": it.get("status", "-"),
+                "type": kind,
+                "maxdisk": float(it.get("maxdisk", 0) or 0),
+            }
+    return m
+
+
+def _apply_fixed(cfg: dict) -> None:
+    g = cfg["global"]
+    g["schedule"] = FIXED_SCHEDULE
+    g["storage"] = FIXED_STORAGE
+    g["dumpdir"] = FIXED_DUMPDIR
+    g["remote"] = FIXED_REMOTE
+
+
+def _migrate_paths(cfg: dict) -> None:
+    g = cfg["global"]
+    old = str(g.pop("remote_subdir", "") or "").strip()
+    if not str(g.get("remote_paths", "") or "").strip() and old:
+        g["remote_paths"] = old
+
+
+def load_conf() -> dict:
+    cfg = {"global": dict(GLOBAL_DEFAULTS), "vms": {}}
+    if not os.path.isfile(CONF):
+        return cfg
+
+    with open(CONF, encoding="utf-8") as f:
+        text = f.read()
+
+    if "[" not in text:
+        return migrate_legacy(text, cfg)
+
+    cp = configparser.ConfigParser(interpolation=None)
+    try:
+        cp.read_string(text)
+    except configparser.Error:
+        return cfg
+
+    if cp.has_section("global"):
+        for k, v in cp.items("global"):
+            cfg["global"][k] = v
+    # 已移除的旧选项
+    cfg["global"].pop("upload_failure_fatal", None)
+    cfg["global"].pop("retention", None)
+
+    for sect in cp.sections():
+        if sect.startswith("vm:"):
+            vmid = sect.split(":", 1)[1].strip()
+            if vmid:
+                cfg["vms"][vmid] = {k: v for k, v in cp.items(sect)}
+                for legacy in ("name", "schedule", "retention", "remote_subdir", "remote_keep"):
+                    cfg["vms"][vmid].pop(legacy, None)
+    _migrate_paths(cfg)
+    _apply_fixed(cfg)
+    return cfg
+
+
+def migrate_legacy(text: str, cfg: dict) -> dict:
+    """把旧的 KEY=value 配置迁移为 INI 格式。"""
+    legacy = {}
+    for line in text.splitlines():
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        k, v = line.split("=", 1)
+        v = v.strip()
+        if len(v) >= 2 and v[0] == v[-1] and v[0] in "\"'":
+            v = v[1:-1]
+        legacy[k.strip()] = v
+
+    for old, new in LEGACY_MAP.items():
+        if old in legacy:
+            cfg["global"][new] = legacy[old]
+
+    ids = legacy.get("VMIDS", "all").strip()
+    if ids.lower() == "all":
+        targets = list(guest_map().keys())
+    else:
+        targets = ids.split()
+    for vmid in targets:
+        cfg["vms"][vmid] = {"enabled": "1"}
+
+    _migrate_paths(cfg)
+    _apply_fixed(cfg)
+    save_conf(cfg)
+    log(f"配置已从旧格式迁移为 INI（{len(cfg['vms'])} 台虚拟机）")
+    return cfg
+
+
+def save_conf(cfg: dict) -> None:
+    cfg["global"].pop("upload_failure_fatal", None)
+    cp = configparser.ConfigParser(interpolation=None)
+    cp["global"] = {k: str(v) for k, v in cfg["global"].items()}
+    for vmid in sorted(cfg["vms"], key=lambda x: int(x) if x.isdigit() else 0):
+        vm = cfg["vms"][vmid]
+        cp[f"vm:{vmid}"] = {k: str(v) for k, v in vm.items() if str(v) != ""}
+    with open(CONF, "w", encoding="utf-8") as f:
+        f.write(f"# 由 {SELF_PATH} 生成 {dt.datetime.now():%Y-%m-%d %H:%M:%S}\n")
+        cp.write(f)
+    os.chmod(CONF, 0o644)
+    notify_daemon()
+
+
+def target_params(cfg: dict, vmid: str, guests: dict = None) -> dict:
+    """返回某台虚拟机的生效参数（未设置的继承全局）。名称始终来自 PVE。"""
+    g = cfg["global"]
+    vm = cfg["vms"].get(str(vmid), {})
+    if guests is None:
+        guests = guest_map()
+    name = str(guests.get(str(vmid), {}).get("name", "")).strip()
+
+    def pick(key, default=""):
+        v = str(vm.get(key, "")).strip()
+        return v if v else str(g.get(key, default))
+
+    return {
+        "vmid": str(vmid),
+        "name": name,
+        "enabled": str(vm.get("enabled", "1")).strip() != "0",
+        "storage": str(g.get("storage", "local")),
+        "dumpdir": str(g.get("dumpdir", "/var/lib/vz/dump")),
+        "mode": pick("mode", "snapshot"),
+        "compress": pick("compress", "zstd"),
+        "local_prune": pick("local_prune", "keep-last=3"),
+        "remote": str(g.get("remote", "webdav")),
+        "delete_local": pick("delete_local", "0"),
+        "verify_hash": pick("verify_hash", "0"),
+        "rclone_retries": str(g.get("rclone_retries", "5")),
+        "rclone_timeout": str(g.get("rclone_timeout", "10m")),
+    }
+
+
+def enabled_vmids(cfg: dict) -> list:
+    return [vmid for vmid in sorted(cfg["vms"], key=lambda x: int(x) if x.isdigit() else 0)
+            if str(cfg["vms"][vmid].get("enabled", "1")).strip() != "0"]
+
+
+def rclone_remote_exists(remote: str) -> bool:
+    if not rclone_available():
+        return False
+    try:
+        out = subprocess.run([RCLONE, "listremotes", "--config", RCLONE_CONFIG],
+                             capture_output=True, text=True)
+    except OSError:
+        return False
+    return any(x.strip() == f"{remote}:" for x in out.stdout.splitlines())
+
+
+# ------------------------------------------------------------------ 上传
+def remote_file_size(p: dict, remote_path: str):
+    out = subprocess.run([RCLONE, "lsl", remote_path, "--config", RCLONE_CONFIG],
+                         capture_output=True, text=True)
+    if out.returncode != 0 or not out.stdout.strip():
+        return None
+    try:
+        return int(out.stdout.strip().splitlines()[0].split()[0])
+    except (ValueError, IndexError):
+        return None
+
+
+def sha256_local(path: str) -> str:
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1024 * 1024), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def sha256_remote(remote_path: str) -> str:
+    proc = subprocess.Popen([RCLONE, "cat", remote_path, "--config", RCLONE_CONFIG],
+                            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+    h = hashlib.sha256()
+    for chunk in iter(lambda: proc.stdout.read(1024 * 1024), b""):
+        h.update(chunk)
+    proc.wait()
+    return h.hexdigest()
+
+
+def upload_file(p: dict, path: str, remote_dir: str, allow_delete: bool = True):
+    base = os.path.basename(path)
+    size = os.path.getsize(path)
+    remote = f"{remote_dir}/{base}"
+
+    rsize = remote_file_size(p, remote)
+    if rsize == size:
+        say(f"  [跳过] {base} —— 远端已存在且大小一致")
+        return ("skipped", size, 0)
+
+    say(f"  [上传] {base} ({hsize(size)}) -> {remote_dir}/")
+    t0 = time.time()
+    rc = run_stream([
+        RCLONE, "copyto", path, remote,
+        "--config", RCLONE_CONFIG,
+        "--checksum",
+        "--retries", p["rclone_retries"],
+        "--low-level-retries", "20",
+        "--timeout", p["rclone_timeout"],
+        "--contimeout", "30s",
+        "--stats", "5s", "--stats-one-line",
+        "--log-level", "INFO",
+    ], to_log=True)
+    dur = max(1, int(time.time() - t0))
+
+    if rc != 0:
+        say(f"  [失败] {base} —— rclone 退出码 {rc}")
+        return ("failed", size, dur)
+
+    rsize = remote_file_size(p, remote)
+    if rsize != size:
+        say(f"  [失败] {base} —— 大小不一致 本地={size} 远端={rsize}")
+        return ("failed", size, dur)
+
+    if p["verify_hash"] == "1":
+        say("  [校验] 计算 SHA256 ...")
+        lh = sha256_local(path)
+        rh = sha256_remote(remote)
+        if lh != rh:
+            say(f"  [失败] {base} —— SHA256 不一致")
+            return ("failed", size, dur)
+        say(f"  [校验] SHA256 一致: {lh}")
+
+    say(f"  [完成] {base} 用时 {dur}s，平均 {hsize(size // dur)}/s")
+
+    if allow_delete and p["delete_local"] == "1":
+        try:
+            os.remove(path)
+            say(f"  [清理] 已删除本地 {base}")
+        except OSError as e:
+            say(f"  [警告] 删除本地失败: {e}")
+
+    return ("ok", size, dur)
+
+
+RUN_DIR_RE = re.compile(r"^\d{4}-\d{2}-\d{2}_\d{2}:\d{2}$")
+
+
+def run_dir_name(ts: dt.datetime = None) -> str:
+    return (ts or dt.datetime.now()).strftime("%Y-%m-%d_%H:%M")
+
+
+def remote_paths(cfg: dict) -> list:
+    g = cfg["global"]
+    raw = str(g.get("remote_paths", "") or "").strip()
+    if not raw:
+        raw = str(g.get("remote_subdir", "") or "").strip()
+    if not raw:
+        return []
+    raw = raw.replace("，", ",")
+    parts = raw.splitlines() if "\n" in raw else raw.split(",")
+    return [p.strip().strip("/") for p in parts if p.strip()]
+
+
+def host_label(cfg: dict) -> str:
+    host = str(cfg["global"].get("host_name", "") or "").strip().strip("/")
+    return host or socket.gethostname()
+
+
+def remote_bases(cfg: dict) -> list:
+    remote = cfg["global"].get("remote", "webdav")
+    host = host_label(cfg)
+    return [f"{remote}:{p}/{host}" for p in remote_paths(cfg)]
+
+
+def list_run_dirs(base: str) -> list:
+    out = run_capture([RCLONE, "lsf", base, "--config", RCLONE_CONFIG, "--dirs-only"])
+    names = [x.strip().rstrip("/") for x in out.splitlines() if x.strip()]
+    return sorted(n for n in names if RUN_DIR_RE.match(n))
+
+
+def enforce_folder_keep(cfg: dict):
+    """对每个远端目录，只保留最新 N 个时间文件夹，超出的整个文件夹删除。"""
+    keep = str(cfg["global"].get("remote_keep", "")).strip()
+    if not keep.isdigit() or int(keep) <= 0:
+        return None
+    keep = int(keep)
+    msgs = []
+    for base in remote_bases(cfg):
+        dirs = list_run_dirs(base)
+        if len(dirs) <= keep:
+            msgs.append(f"{base}: {len(dirs)} 个")
+            continue
+        removed = 0
+        for name in dirs[:-keep]:
+            rc = subprocess.run([RCLONE, "purge", f"{base}/{name}",
+                                 "--config", RCLONE_CONFIG],
+                                capture_output=True, text=True).returncode
+            if rc == 0:
+                removed += 1
+        msgs.append(f"{base}: 删除 {removed} 个，保留 {keep} 个")
+    return "；".join(msgs) if msgs else None
+
+
+# ------------------------------------------------------------------ 状态
+def show_vm_table(cfg: dict) -> None:
+    guests = guest_map()
+    if not cfg["vms"]:
+        print("  (尚未配置任何虚拟机，使用 add 命令添加)")
+        return
+    print("  " + pad("VMID", 6) + pad("名称", 18) + pad("运行", 10)
+          + pad("启用", 6) + pad("模式", 11) + "压缩")
+    for vmid in sorted(cfg["vms"], key=lambda x: int(x) if x.isdigit() else 0):
+        p = target_params(cfg, vmid, guests)
+        info = guests.get(vmid, {})
+        name = p["name"] or "-"
+        status = info.get("status", "不存在")
+        print("  " + pad(vmid, 6) + pad(name[:16], 18) + pad(status, 10)
+              + pad("✅" if p["enabled"] else "❌", 6)
+              + pad(p["mode"], 11) + p["compress"])
+
+
+DAY_CN = {"mon": "一", "tue": "二", "wed": "三", "thu": "四",
+          "fri": "五", "sat": "六", "sun": "日"}
+
+
+def schedule_text(spec: str) -> str:
+    spec = str(spec or "").strip()
+    if not spec:
+        return "-"
+    parts = spec.split()
+    head = parts[0].lower()
+    if head == "daily" and len(parts) >= 2:
+        return f"每天 {parts[1]}"
+    if head == "weekly" and len(parts) >= 3:
+        day = DAY_CN.get(parts[1].lower()[:3], parts[1])
+        return f"每周{day} {parts[2]}"
+    if head == "monthly" and len(parts) >= 3 and parts[1].isdigit():
+        return f"每月 {int(parts[1])} 号 {parts[2]}"
+    if ":" in spec and " " not in spec:
+        return f"每天 {spec}"
+    return spec
+
+
+def act_status(cfg: dict) -> None:
+    vms = sorted(cfg["vms"], key=lambda x: int(x) if x.isdigit() else 0)
+    total = sum(1 for v in vms
+                if str(cfg["vms"][v].get("enabled", "1")).strip() != "0")
+    auto = str(cfg["global"].get("auto_enabled", "1")) == "1"
+    running = run_capture(["systemctl", "is-active", DAEMON_UNIT]) == "active"
+
+    state = load_state()
+    spec = cfg["global"].get("schedule", "02:30")
+    base = parse_iso(state.get("last")) or dt.datetime.now()
+    nxt = next_run(spec, base)
+
+    section("PVE 自动备份状态")
+    if total == 0:
+        print(f"  {pad('自动备份', 10)} ❌ 未配置任何虚拟机")
+    elif auto and running:
+        print(f"  {pad('自动备份', 10)} ✅ 已开启（调度服务运行中）")
+    elif auto:
+        print(f"  {pad('自动备份', 10)} ⚠️ 已启用但调度服务未运行")
+    else:
+        print(f"  {pad('自动备份', 10)} ❌ 已关闭")
+    print(f"  {pad('执行时间', 10)} {schedule_text(spec)}")
+    print(f"  {pad('下次执行', 10)} {nxt:%Y-%m-%d %H:%M:%S}" if nxt else f"  {pad('下次执行', 10)} 未知")
+    ran = parse_iso(state.get("ran"))
+    print(f"  {pad('上次执行', 10)} {ran:%Y-%m-%d %H:%M:%S}" if ran else f"  {pad('上次执行', 10)} (尚无执行记录)")
+    print(f"  {pad('虚拟机数', 10)} {total} 台")
+    print(f"  {pad('调度服务', 10)} {DAEMON_UNIT}（{run_capture(['systemctl', 'is-active', DAEMON_UNIT]) or 'inactive'}）")
+    print(f"  {pad('脚本', 10)} {SELF_PATH}")
+    print(f"  {pad('配置', 10)} {CONF}")
+
+    section("备份虚拟机")
+    show_vm_table(cfg)
+
+    section("存储与目标")
+    g = cfg["global"]
+    print(f"  {pad('本地目录', 10)} {g.get('dumpdir')}（存储 {g.get('storage')}）")
+    print(f"  {pad('主机标识', 10)} {host_label(cfg)}")
+    print(f"  {pad('远端目录', 10)}")
+    for b in remote_bases(cfg):
+        print(f"    {b}")
+    print(f"  {pad('保留文件夹', 10)} {g.get('remote_keep') or '不限'}")
+    print(f"  {pad('远端连通', 10)} {'✅ 可访问' if rclone_remote_exists(g.get('remote', '')) else '❌ 不可用'}")
+    if not rclone_available():
+        print(f"  {pad('rclone', 10)} ❌ 未安装（apt install -y rclone）")
+
+    section("最近日志")
+    if os.path.isfile(LOG):
+        with open(LOG, encoding="utf-8", errors="replace") as f:
+            for line in f.readlines()[-6:]:
+                print("  " + line.rstrip("\n"))
+    else:
+        print("  (暂无日志)")
+    say("")
+
+
+# ------------------------------------------------------------------ 备份
+def act_run(cfg: dict, only: str = None) -> int:
+    global LOGGING
+    LOGGING = True
+    if not require_rclone():
+        return 1
+
+    if only is not None:
+        only = str(only)
+        if only not in cfg["vms"]:
+            say(f"错误: VMID {only} 不在配置中")
+            return 1
+        vms = [only]
+    else:
+        vms = enabled_vmids(cfg)
+    if not vms:
+        say("错误: 没有已启用的虚拟机，请先 add")
+        return 1
+    g = cfg["global"]
+    if not rclone_remote_exists(g.get("remote", "")):
+        say(f"错误: rclone remote '{g.get('remote')}' 不存在")
+        return 1
+
+    lock = acquire_lock()
+    if lock is None:
+        say("错误: 等待运行锁超时，已有实例在运行")
+        return 1
+
+    try:
+        section(f"PVE 备份开始 {dt.datetime.now():%Y-%m-%d %H:%M:%S}")
+        say(f"  计划虚拟机: {', '.join(vms)}")
+        say(f"  本地目录  : {g.get('dumpdir')}（存储 {g.get('storage')}）")
+        run_stamp = run_dir_name()
+        run_dirs = [f"{b}/{run_stamp}" for b in remote_bases(cfg)]
+        say("  远端目录  :")
+        for d in run_dirs:
+            say(f"    {d}")
+
+        t_all = time.time()
+        rows = []
+        overall_fail = 0
+        guests = guest_map()
+
+        for vmid in vms:
+            p = target_params(cfg, vmid, guests)
+            name = p["name"] or "-"
+
+            section(f"备份 VM {vmid} ({name})")
+            say(f"  模式 {p['mode']} / 压缩 {p['compress']} / 本机保留 {p['local_prune']}")
+
+            marker = f"{MARKER}.{vmid}"
+            open(marker, "w").close()
+            mm = os.path.getmtime(marker)
+
+            cmd = ["vzdump", str(vmid), "--storage", p["storage"],
+                   "--mode", p["mode"], "--compress", p["compress"]]
+            if p["local_prune"]:
+                cmd += ["--prune-backups", p["local_prune"]]
+
+            say("")
+            say(">>> 调用 vzdump ...")
+            rc = run_stream(cmd, to_log=True)
+            if rc != 0:
+                say(f"!!! VM {vmid} 备份失败 (退出码 {rc})，跳过上传")
+                rows.append((vmid, name, "-", 0, 0, "backup-failed"))
+                overall_fail = 1
+                continue
+
+            files = sorted(
+                f for f in archive_files(p["dumpdir"])
+                if os.path.getmtime(f) >= mm
+            )
+            if not files:
+                say("未发现本次新生成的归档（可能被保留策略清理）")
+                rows.append((vmid, name, "-", 0, 0, "no-archive"))
+                continue
+
+            for f in files:
+                size = os.path.getsize(f)
+                dur_sum = 0
+                st = "ok"
+                for rd in run_dirs:
+                    s, _, d = upload_file(p, f, rd, allow_delete=False)
+                    dur_sum += d
+                    if s == "failed":
+                        st = "failed"
+                    elif s == "skipped" and st == "ok":
+                        st = "skipped"
+                if st != "failed" and p["delete_local"] == "1":
+                    try:
+                        os.remove(f)
+                        say(f"  [清理] 已删除本地 {os.path.basename(f)}")
+                    except OSError as e:
+                        say(f"  [警告] 删除本地失败: {e}")
+                rows.append((vmid, name, os.path.basename(f), size, dur_sum, st))
+                if st == "failed":
+                    overall_fail = 1
+
+        keep_msg = enforce_folder_keep(cfg)
+        if keep_msg:
+            say("")
+            say(f"  远端清理: {keep_msg}")
+
+        total = int(time.time() - t_all)
+        total_size = sum(r[3] for r in rows if r[5] == "ok")
+        section("备份汇总")
+        print(f"  {pad('总耗时', 10)} {total}s")
+        print(f"  {pad('虚拟机数', 10)} {len(vms)}")
+        print(f"  {pad('本次上传', 10)} {hsize(total_size)}")
+        print(f"  {pad('远端目录', 10)} {' | '.join(run_dirs)}")
+        print("")
+        print("  " + pad("VMID", 7) + pad("名称", 18) + pad("文件", 40)
+              + f"{'大小':>10} {'耗时':>5}  结果")
+        for vmid, name, base, size, dur, st in rows:
+            print("  " + pad(vmid, 7) + pad(name[:16], 18) + pad(base, 40)
+                  + f"{hsize(size):>10} {dur:>4}s  {st}")
+
+        say("")
+        if overall_fail:
+            say("  状态: ❌ 存在失败（可执行 upload 重试）")
+        else:
+            say("  状态: ✅ 全部成功")
+        section(f"结束 {dt.datetime.now():%Y-%m-%d %H:%M:%S}")
+        return 1 if overall_fail else 0
+    finally:
+        try:
+            fcntl.flock(lock, fcntl.LOCK_UN)
+            lock.close()
+        except Exception:
+            pass
+        LOGGING = False
+
+
+def act_upload(cfg: dict) -> int:
+    global LOGGING
+    LOGGING = True
+    if not require_rclone():
+        return 1
+    g = cfg["global"]
+    if not rclone_remote_exists(g.get("remote", "")):
+        say(f"错误: rclone remote '{g.get('remote')}' 不存在")
+        return 1
+    lock = acquire_lock()
+    if lock is None:
+        say("错误: 等待运行锁超时")
+        return 1
+    try:
+        section("仅上传模式：按备份时间放入对应的时间文件夹")
+        fail = 0
+        any_file = False
+        bases = remote_bases(cfg)
+        guests = guest_map()
+        for vmid in sorted(cfg["vms"], key=lambda x: int(x) if x.isdigit() else 0):
+            p = target_params(cfg, vmid, guests)
+            files = archive_files(p["dumpdir"], vmid)
+            if not files:
+                continue
+            any_file = True
+            for f in files:
+                stamp = run_dir_name(dt.datetime.fromtimestamp(os.path.getmtime(f)))
+                dirs = [f"{b}/{stamp}" for b in bases]
+                say("")
+                say(f"  VM {vmid} -> {', '.join(dirs)}")
+                st = "ok"
+                for rd in dirs:
+                    s, _, _ = upload_file(p, f, rd, allow_delete=False)
+                    if s == "failed":
+                        st = "failed"
+                if st != "failed" and p["delete_local"] == "1":
+                    try:
+                        os.remove(f)
+                        say(f"  [清理] 已删除本地 {os.path.basename(f)}")
+                    except OSError as e:
+                        say(f"  [警告] 删除本地失败: {e}")
+                if st == "failed":
+                    fail = 1
+        keep_msg = enforce_folder_keep(cfg)
+        if keep_msg:
+            say(f"  远端清理: {keep_msg}")
+        if not any_file:
+            say("  本地没有可上传的备份")
+        say("  结果: ✅ 全部就绪" if fail == 0 else "  结果: ❌ 部分上传失败")
+        return 1 if fail else 0
+    finally:
+        try:
+            fcntl.flock(lock, fcntl.LOCK_UN)
+            lock.close()
+        except Exception:
+            pass
+        LOGGING = False
+
+
+def act_list(cfg: dict) -> None:
+    if not require_rclone():
+        return
+    g = cfg["global"]
+    dumpdir = g.get("dumpdir", "/var/lib/vz/dump")
+    section(f"本地备份 ({dumpdir})")
+    files = archive_files(dumpdir)
+    if not files:
+        print("  (无)")
+    else:
+        print("  " + pad("文件", 46) + f"{'大小':>10}  时间")
+        for f in files:
+            print(f"  {pad(os.path.basename(f), 46)}{hsize(os.path.getsize(f)):>10}  "
+                  f"{dt.datetime.fromtimestamp(os.path.getmtime(f)):%Y-%m-%d %H:%M:%S}")
+        total = sum(os.path.getsize(f) for f in files)
+        print(f"  共 {len(files)} 份 / {hsize(total)}")
+
+    section("远端备份")
+    if not rclone_remote_exists(g.get("remote", "")):
+        print("  remote 不可用")
+        return
+    for base in remote_bases(cfg):
+        print("")
+        print(f"  {base}")
+        dirs = list_run_dirs(base)
+        if not dirs:
+            print("    (无)")
+            continue
+        for d in dirs:
+            out = subprocess.run([RCLONE, "lsl", f"{base}/{d}", "--config", RCLONE_CONFIG],
+                                 capture_output=True, text=True)
+            rows = []
+            total = 0
+            for line in (out.stdout or "").splitlines():
+                parts = line.split(None, 3)
+                if len(parts) != 4:
+                    continue
+                try:
+                    size = int(parts[0])
+                except ValueError:
+                    continue
+                ts = f"{parts[1]} {parts[2].split('.')[0]}"
+                rows.append((parts[3], size, ts))
+                total += size
+            print(f"    {d}/  ({len(rows)} 个文件 / {hsize(total)})")
+            for name, size, ts in sorted(rows):
+                print(f"      {pad(name, 46)}{hsize(size):>10}  {ts}")
+        print(f"    共 {len(dirs)} 个时间文件夹（保留上限 {cfg['global'].get('remote_keep') or '不限'}）")
+
+
+def act_config(cfg: dict) -> None:
+    section(f"全局配置 ({CONF})")
+    for k, v in cfg["global"].items():
+        print(f"  {pad(k, 18)} {v}")
+    guests = guest_map()
+    for vmid in sorted(cfg["vms"], key=lambda x: int(x) if x.isdigit() else 0):
+        section(f"虚拟机 {vmid}")
+        p = target_params(cfg, vmid, guests)
+        print(f"  {pad('名称(自动)', 18)} {p['name'] or '-'}")
+        for k in ("enabled", "mode", "compress", "local_prune",
+                  "delete_local", "verify_hash"):
+            val = p[k]
+            if isinstance(val, bool):
+                val = "1" if val else "0"
+            print(f"  {pad(k, 18)} {val}")
+            val = p[k]
+            if isinstance(val, bool):
+                val = "1" if val else "0"
+            print(f"  {pad(k, 18)} {val}")
+
+
+# ------------------------------------------------------------------ 虚拟机管理
+def add_vm(cfg: dict, vmid: str, values: dict, overwrite: bool = False) -> bool:
+    vmid = str(vmid).strip()
+    if not vmid.isdigit():
+        print(f"无效 VMID: {vmid}")
+        return False
+    guests = guest_map()
+    if vmid not in guests:
+        print(f"错误: 当前节点不存在 VMID {vmid}，不能添加")
+        return False
+    if vmid in cfg["vms"] and not overwrite:
+        print(f"VMID {vmid} 已存在，使用 edit 修改")
+        return False
+    vm = cfg["vms"].get(vmid, {})
+    vm["enabled"] = vm.get("enabled", "1")
+    for k, v in values.items():
+        if v is not None:
+            vm[k] = str(v)
+    cfg["vms"][vmid] = vm
+    save_conf(cfg)
+    sync_service(cfg)
+    print(f"已{'更新' if overwrite else '添加'} VM {vmid}")
+    return True
+
+
+def remove_vm(cfg: dict, vmid: str) -> bool:
+    vmid = str(vmid)
+    if vmid not in cfg["vms"]:
+        print(f"VMID {vmid} 不在配置中")
+        return False
+    del cfg["vms"][vmid]
+    save_conf(cfg)
+    sync_service(cfg)
+    print(f"已移除 VM {vmid}（备份文件不会被删除）")
+    return True
+
+
+def parse_vm_options(rest: list) -> dict:
+    ap = argparse.ArgumentParser(prog="pve-backup")
+    ap.add_argument("vmid")
+    ap.add_argument("--mode", choices=["snapshot", "suspend", "stop"])
+    ap.add_argument("--compress", choices=["zstd", "gzip", "lzo", "0"])
+    ap.add_argument("--prune", help="本机保留，如 keep-last=3")
+    ap.add_argument("--delete-local", action="store_true")
+    ap.add_argument("--keep-local", action="store_true")
+    ap.add_argument("--verify-hash", action="store_true")
+    ap.add_argument("--no-verify-hash", action="store_true")
+    ap.add_argument("--enable", action="store_true")
+    ap.add_argument("--disable", action="store_true")
+    return vars(ap.parse_args(rest))
+
+
+def vm_values_from_args(a: dict) -> dict:
+    v = {}
+    for src, dst in (("mode", "mode"), ("compress", "compress"),
+                     ("prune", "local_prune")):
+        if a.get(src) is not None:
+            v[dst] = a[src]
+    if a.get("delete_local"):
+        v["delete_local"] = "1"
+    if a.get("keep_local"):
+        v["delete_local"] = "0"
+    if a.get("verify_hash"):
+        v["verify_hash"] = "1"
+    if a.get("no_verify_hash"):
+        v["verify_hash"] = "0"
+    if a.get("enable"):
+        v["enabled"] = "1"
+    if a.get("disable"):
+        v["enabled"] = "0"
+    return v
+
+
+# ------------------------------------------------------------------ 选择器
+def pick(title: str, options: list, default: int = 0,
+         footer: str = "↑/↓ 或 j/k 选择   Enter 确认   q 取消"):
+    """上下键选择器；返回索引，取消返回 None。非终端环境退化为数字菜单。"""
+    if not options:
+        return None
+    if curses is None or not (sys.stdin.isatty() and sys.stdout.isatty()):
+        print(f"\n{title}")
+        for i, opt in enumerate(options, 1):
+            print(f"  {i}) {opt}")
+        try:
+            c = input("请选择: ").strip()
+        except (EOFError, KeyboardInterrupt):
+            return None
+        if c.isdigit() and 1 <= int(c) <= len(options):
+            return int(c) - 1
+        return None
+
+    def _loop(stdscr):
+        stdscr.keypad(True)
+        try:
+            curses.curs_set(0)
+        except Exception:
+            pass
+        pos = min(max(default, 0), len(options) - 1)
+        while True:
+            stdscr.clear()
+            h, w = stdscr.getmaxyx()
+            try:
+                stdscr.addstr(1, 2, title, curses.A_BOLD)
+                stdscr.addstr(2, 2, LINE[: max(0, w - 4)])
+            except Exception:
+                pass
+            for i, opt in enumerate(options):
+                attr = curses.A_REVERSE if i == pos else curses.A_NORMAL
+                try:
+                    stdscr.addstr(4 + i, 4, f"  {opt}  ", attr)
+                except Exception:
+                    pass
+            try:
+                stdscr.addstr(4 + len(options) + 1, 2, footer)
+                stdscr.refresh()
+            except Exception:
+                pass
+            ch = stdscr.getch()
+            if ch in (curses.KEY_UP, ord("k")):
+                pos = (pos - 1) % len(options)
+            elif ch in (curses.KEY_DOWN, ord("j")):
+                pos = (pos + 1) % len(options)
+            elif ch in (10, 13, curses.KEY_ENTER):
+                return pos
+            elif ch in (ord("q"), 27):
+                return None
+
+    return curses.wrapper(_loop)
+
+
+def confirm(title: str, yes: str = "是，继续", no: str = "否，取消") -> bool:
+    idx = pick(title, [no, yes], default=0)
+    return idx == 1
+
+
+def pick_vm(cfg: dict, title: str):
+    vms = sorted(cfg["vms"], key=lambda x: int(x) if x.isdigit() else 0)
+    if not vms:
+        print("尚无已配置的虚拟机")
+        return None
+    guests = guest_map()
+    opts = []
+    for v in vms:
+        name = guests.get(v, {}).get("name", "-")
+        opts.append(f"{v}  {name}")
+    idx = pick(title, opts + ["返回"])
+    if idx is None or idx == len(opts):
+        return None
+    return vms[idx]
+
+
+# ------------------------------------------------------------------ 虚拟机交互
+def interactive_vm_menu(cfg: dict) -> None:
+    while True:
+        idx = pick("虚拟机备份管理", [
+            "查看已配置虚拟机",
+            "添加虚拟机",
+            "修改虚拟机参数",
+            "删除虚拟机",
+            "启用 / 停用虚拟机",
+            "返回",
+        ])
+        if idx is None or idx == 5:
+            return
+        cfg = load_conf()
+
+        if idx == 0:
+            section("已配置虚拟机")
+            show_vm_table(cfg)
+
+        elif idx == 1:
+            guests = guest_map()
+            candidates = [v for v in sorted(guests, key=lambda x: int(x) if x.isdigit() else 0)
+                          if v not in cfg["vms"]]
+            if not candidates:
+                print("没有可添加的虚拟机（节点上的虚拟机都已加入）")
+                try:
+                    input("\n按回车返回...")
+                except (EOFError, KeyboardInterrupt):
+                    return
+                continue
+            opts = [f"{v}  {guests[v]['name']}" for v in candidates]
+            choice = pick("选择要添加的虚拟机", opts + ["返回"])
+            if choice is None or choice == len(opts):
+                continue
+            vmid = candidates[choice]
+            if vmid:
+                add_vm(cfg, vmid, {})
+                cfg = load_conf()
+                edit_vm_interactive(cfg, vmid)
+
+        elif idx == 2:
+            vmid = pick_vm(cfg, "选择要修改的虚拟机")
+            if vmid:
+                edit_vm_interactive(cfg, vmid)
+
+        elif idx == 3:
+            vmid = pick_vm(cfg, "选择要删除的虚拟机")
+            if vmid and confirm(f"确认从备份列表移除 VM {vmid}？", "是，移除", "否，取消"):
+                remove_vm(cfg, vmid)
+
+        elif idx == 4:
+            vmid = pick_vm(cfg, "选择要启用/停用的虚拟机")
+            if vmid:
+                cur = cfg["vms"][vmid].get("enabled", "1")
+                new = "0" if cur != "0" else "1"
+                cfg["vms"][vmid]["enabled"] = new
+                save_conf(cfg)
+                sync_service(cfg)
+                print(f"VM {vmid} 已{'启用' if new == '1' else '停用'}")
+
+        try:
+            input("\n按回车返回...")
+        except (EOFError, KeyboardInterrupt):
+            return
+
+
+def edit_vm_interactive(cfg: dict, vmid: str) -> None:
+    cfg["vms"].setdefault(vmid, {"enabled": "1"})
+    guests = guest_map()
+    while True:
+        p = target_params(cfg, vmid, guests)
+        labels = [
+            ("mode", f"备份模式: {p['mode']}"),
+            ("compress", f"压缩: {p['compress']}"),
+            ("local_prune", f"本机保留: {p['local_prune']}"),
+            ("delete_local", f"上传后删本地: {p['delete_local']}"),
+            ("verify_hash", f"SHA256 校验: {p['verify_hash']}"),
+            ("enabled", f"启用: {'1' if p['enabled'] else '0'}"),
+        ]
+        idx = pick(f"修改 VM {vmid}（{p['name'] or '-'}）参数",
+                   [x[1] for x in labels] + ["完成并返回"])
+        if idx is None or idx == len(labels):
+            save_conf(cfg)
+            print(f"VM {vmid} 参数已保存")
+            return
+
+        key = labels[idx][0]
+        vm = cfg["vms"][vmid]
+
+        if key == "mode":
+            v = pick("选择备份模式", ["snapshot（快照，不停机）",
+                                     "suspend（短暂挂起）",
+                                     "stop（关机备份）"])
+            if v is not None:
+                vm[key] = ["snapshot", "suspend", "stop"][v]
+        elif key == "compress":
+            v = pick("选择压缩算法", ["zstd", "gzip", "lzo", "0（不压缩）"])
+            if v is not None:
+                vm[key] = ["zstd", "gzip", "lzo", "0"][v]
+        elif key in ("delete_local", "verify_hash", "enabled"):
+            if key == "enabled":
+                cur_on = "1" if p["enabled"] else "0"
+            else:
+                cur_on = str(vm.get(key, "")).strip() or p[key]
+            v = pick("选择值", ["1（开启）", "0（关闭）"],
+                     default=0 if cur_on == "1" else 1)
+            if v is not None:
+                vm[key] = "1" if v == 0 else "0"
+        else:
+            try:
+                v = input(f"{labels[idx][1]}\n输入新值（直接回车保持当前值）: ").strip()
+            except (EOFError, KeyboardInterrupt):
+                continue
+            if v or key == "local_prune":
+                vm[key] = v
+
+        save_conf(cfg)
+        sync_service(cfg)
+
+
+# ------------------------------------------------------------------ 全局配置
+def edit_global_config(cfg: dict) -> None:
+    g = cfg["global"]
+    while True:
+        items = [
+            ("webdav", "WebDAV 连接（地址/账号/密码）"),
+            ("host_name", f"远端主机子目录: {g.get('host_name') or host_label(cfg)}"),
+            ("remote_paths", f"远端目录（多个用逗号分隔）: {g.get('remote_paths') or g.get('remote_subdir') or '(未设置)'}"),
+            ("mode", f"默认备份模式: {g.get('mode')}"),
+            ("compress", f"默认压缩: {g.get('compress')}"),
+            ("local_prune", f"默认本机保留: {g.get('local_prune')}"),
+            ("remote_keep", f"保留时间文件夹数: {g.get('remote_keep') or '<不限>'}"),
+        ]
+        idx = pick("修改全局配置", [x[1] for x in items] + ["返回"])
+        if idx is None or idx == len(items):
+            return
+
+        key = items[idx][0]
+
+        if key == "webdav":
+            configure_webdav(cfg)
+            continue
+
+        if key == "mode":
+            v = pick("默认备份模式", ["snapshot（快照，不停机）",
+                                     "suspend（短暂挂起）",
+                                     "stop（关机备份）"])
+            if v is None:
+                continue
+            g[key] = ["snapshot", "suspend", "stop"][v]
+        elif key == "compress":
+            v = pick("默认压缩算法", ["zstd", "gzip", "lzo", "0（不压缩）"])
+            if v is None:
+                continue
+            g[key] = ["zstd", "gzip", "lzo", "0"][v]
+        else:
+            try:
+                v = input(f"{items[idx][1]}\n输入新值（直接回车保持当前值）: ").strip()
+            except (EOFError, KeyboardInterrupt):
+                continue
+            if key == "host_name" and v and ("/" in v or "\\" in v):
+                print("主机子目录不能包含斜杠")
+                continue
+            if v or key in ("remote_keep", "host_name"):
+                g[key] = v
+
+        save_conf(cfg)
+        print("已保存")
+        if key == "host_name":
+            print(f"远端主机子目录: {host_label(cfg)}")
+        elif key == "schedule":
+            print(f"已通知调度服务重新计算：{schedule_text(g.get('schedule'))}")
+
+
+# ------------------------------------------------------------------ 服务注册
+DAEMON_UNIT = "pve-backup.service"
+
+
+def write_daemon_unit() -> None:
+    with open(os.path.join(UNIT_DIR, DAEMON_UNIT), "w", encoding="utf-8") as f:
+        f.write(
+            "[Unit]\n"
+            "Description=PVE backup scheduler (daemon)\n"
+            "Wants=network-online.target\n"
+            "After=network-online.target pve-cluster.service pvestatd.service\n\n"
+            "[Service]\n"
+            "Type=simple\n"
+            f"ExecStart={SELF_PATH} daemon\n"
+            "Restart=always\n"
+            "RestartSec=10\n"
+            "Nice=10\n"
+            "IOSchedulingClass=best-effort\n"
+            "IOSchedulingPriority=7\n\n"
+            "[Install]\n"
+            "WantedBy=multi-user.target\n"
+        )
+
+
+def sync_service(cfg: dict) -> None:
+    """重建常驻调度服务，并清理旧的 timer / 按 VM 单元。"""
+    write_daemon_unit()
+
+    stale_units = []
+    for pattern in ("pve-backup-vm*.*", "pve-backup-webdav.*"):
+        for path in glob.glob(os.path.join(UNIT_DIR, pattern)):
+            stale_units.append(os.path.basename(path))
+            try:
+                os.remove(path)
+            except OSError:
+                pass
+    for link in glob.glob(os.path.join(UNIT_DIR, "timers.target.wants", "pve-backup-*.timer")):
+        try:
+            os.remove(link)
+        except OSError:
+            pass
+    for name in stale_units + [SERVICE_NAME, TIMER_NAME]:
+        subprocess.run(["systemctl", "reset-failed", name], capture_output=True)
+
+    subprocess.run(["systemctl", "daemon-reload"], capture_output=True)
+
+    auto = str(cfg["global"].get("auto_enabled", "1")) == "1"
+    if auto:
+        subprocess.run(["systemctl", "enable", "--now", DAEMON_UNIT], capture_output=True)
+    else:
+        subprocess.run(["systemctl", "disable", "--now", DAEMON_UNIT], capture_output=True)
+
+
+def write_logrotate() -> None:
+    with open(LOGROTATE_FILE, "w", encoding="utf-8") as f:
+        f.write(f"{LOG} {{\n    weekly\n    rotate 8\n    missingok\n    notifempty\n"
+                f"    compress\n    copytruncate\n    su root root\n}}\n")
+
+
+def looks_like_self(path: str) -> bool:
+    try:
+        with open(path, encoding="utf-8", errors="ignore") as f:
+            return "pve-backup-single-file-v1" in f.read(4096)
+    except OSError:
+        return False
+
+
+def do_install(cfg: dict, args) -> bool:
+    if not require_rclone():
+        return False
+    section("自动注册 PVE 备份服务")
+    g = cfg["global"]
+
+    src = os.path.realpath(sys.argv[0])
+    if src != SELF_PATH and looks_like_self(src):
+        shutil.copy2(src, SELF_PATH)
+        os.chmod(SELF_PATH, 0o755)
+        say(f"  [1/6] 已安装脚本: {SELF_PATH}")
+    else:
+        try:
+            os.chmod(SELF_PATH, 0o755)
+            say(f"  [1/6] 脚本已就位: {SELF_PATH}")
+        except OSError:
+            say(f"  [1/6] 警告: 找不到 {SELF_PATH}，请从脚本副本重新执行 install")
+            return False
+
+    if getattr(args, "url", None):
+        if not args.user:
+            say("错误: --url 需要同时提供 --user")
+            return False
+        obscured = subprocess.run([RCLONE, "obscure", args.passwd or ""],
+                                  capture_output=True, text=True).stdout.strip()
+        rc = subprocess.run(
+            [RCLONE, "config", "create", g["remote"], "webdav",
+             f"url={args.url}", "vendor=other", f"user={args.user}",
+             f"pass={obscured}", "--config", RCLONE_CONFIG],
+            capture_output=True, text=True).returncode
+        say(f"  [2/6] {'已注册' if rc == 0 else '注册失败'} rclone remote: {g['remote']}")
+    elif rclone_remote_exists(g.get("remote", "")):
+        say(f"  [2/6] rclone remote 已存在: {g['remote']}")
+    else:
+        say(f"  [2/6] 警告: rclone remote '{g.get('remote')}' 不存在")
+
+    if getattr(args, "vmid", None):
+        for vmid in str(args.vmid).split():
+            add_vm(cfg, vmid, {}, overwrite=True)
+    for key in ("mode", "compress"):
+        val = getattr(args, key, None)
+        if val:
+            g[key] = val
+    if getattr(args, "prune", None) is not None:
+        g["local_prune"] = args.prune
+    if getattr(args, "paths", None) is not None:
+        g["remote_paths"] = args.paths
+    elif getattr(args, "subdir", None) is not None:
+        g["remote_paths"] = args.subdir
+    if getattr(args, "host", None):
+        g["host_name"] = args.host
+    if getattr(args, "keep", None) is not None:
+        g["remote_keep"] = args.keep
+
+    if getattr(args, "no_timer", False):
+        g["auto_enabled"] = "0"
+
+    save_conf(cfg)
+    say(f"  [3/6] 已写入配置: {CONF}")
+
+    write_logrotate()
+    say(f"  [4/6] 已生成日志轮转: {LOGROTATE_FILE}")
+
+    sync_service(cfg)
+    n = len(cfg["vms"])
+    say(f"  [5/6] 已生成调度服务（{n} 个备份计划）")
+
+    auto = str(g.get("auto_enabled", "1")) == "1"
+    say(f"  [6/6] 自动备份: {'已开启' if auto else '已关闭'}")
+
+    section("注册完成")
+    print(f"  脚本     : {SELF_PATH}")
+    print(f"  配置     : {CONF}")
+    print(f"  调度服务 : {DAEMON_UNIT}")
+    print(f"  备份计划 : {n} 个")
+    print(f"  自动备份 : {'已开启' if auto else '已关闭'}")
+    print(f"  虚拟机   : {', '.join(sorted(cfg['vms'])) or '(未配置)'}")
+    print(f"  日志     : {LOG}")
+    return True
+
+
+def do_reset() -> None:
+    section("重置调度状态")
+    subprocess.run(["systemctl", "stop", DAEMON_UNIT], capture_output=True)
+    try:
+        os.remove(STATE_FILE)
+        say("  已清空调度状态")
+    except FileNotFoundError:
+        say("  调度状态本来就为空")
+    if os.path.isfile(os.path.join(UNIT_DIR, DAEMON_UNIT)):
+        subprocess.run(["systemctl", "start", DAEMON_UNIT], capture_output=True)
+        say("  已重启调度服务")
+    else:
+        say("  服务未安装，仅清理了状态（请执行 install）")
+    say("  配置与备份文件未受影响")
+
+
+def do_uninstall() -> None:
+    section("注销 PVE 备份服务")
+    subprocess.run(["systemctl", "disable", "--now", DAEMON_UNIT], capture_output=True)
+    subprocess.run(["systemctl", "disable", "--now", TIMER_NAME], capture_output=True)
+    for path in glob.glob(os.path.join(UNIT_DIR, "pve-backup-vm*.*")):
+        try:
+            os.remove(path)
+        except OSError:
+            pass
+    for link in glob.glob(os.path.join(UNIT_DIR, "timers.target.wants", "pve-backup-*.timer")):
+        try:
+            os.remove(link)
+        except OSError:
+            pass
+    for f in (os.path.join(UNIT_DIR, DAEMON_UNIT),
+              os.path.join(UNIT_DIR, SERVICE_NAME),
+              os.path.join(UNIT_DIR, TIMER_NAME),
+              LOGROTATE_FILE):
+        try:
+            os.remove(f)
+        except FileNotFoundError:
+            pass
+    subprocess.run(["systemctl", "daemon-reload"], capture_output=True)
+    say("  已卸载备份服务（配置和备份已保留）")
+    say(f"  保留: {CONF} / {SELF_PATH} / 备份文件")
+
+
+# ------------------------------------------------------------------ 调度守护
+def cmd_daemon() -> int:
+    """常驻调度服务：精确睡到下次执行时间，配置变化通过 SIGHUP 唤醒。"""
+    log(f"调度服务启动 pid={os.getpid()}")
+    if not require_rclone():
+        log("rclone 未安装，调度服务退出")
+        return 1
+
+    rfd, wfd = os.pipe()
+    os.set_blocking(rfd, False)
+    os.set_blocking(wfd, False)
+    old_wakeup = signal.set_wakeup_fd(wfd)
+    signal.signal(signal.SIGHUP, lambda *_: None)
+
+    cfg = load_conf()
+    state = load_state()
+    last_mtime = None
+    next_at = None
+
+    def drain() -> None:
+        try:
+            while os.read(rfd, 4096):
+                pass
+        except (BlockingIOError, OSError):
+            pass
+
+    def reload(now):
+        nonlocal cfg, state, last_mtime, next_at
+        cfg = load_conf()
+        state = load_state()
+        try:
+            last_mtime = os.path.getmtime(CONF)
+        except OSError:
+            last_mtime = None
+        base = parse_iso(state.get("last"))
+        if base is None:
+            state["last"] = now.isoformat(timespec="seconds")
+            save_state(state)
+            base = now
+        spec = cfg["global"].get("schedule", "02:30")
+        next_at = next_run(spec, base)
+        log(f"已加载配置（执行时间 {schedule_text(spec)}，下次 {next_at or '未知'}）")
+
+    reload(dt.datetime.now())
+
+    try:
+        while True:
+            try:
+                mtime = os.path.getmtime(CONF)
+            except OSError:
+                mtime = None
+            if mtime != last_mtime:
+                reload(dt.datetime.now())
+
+            if str(cfg["global"].get("auto_enabled", "1")) != "1":
+                select.select([rfd], [], [], 60)
+                drain()
+                continue
+
+            now = dt.datetime.now()
+            if next_at and now >= next_at:
+                log("触发全局备份计划")
+                act_run(cfg)
+                ts = dt.datetime.now()
+                state["last"] = ts.isoformat(timespec="seconds")
+                state["ran"] = ts.isoformat(timespec="seconds")
+                save_state(state)
+                next_at = next_run(cfg["global"].get("schedule", "02:30"), ts)
+                continue
+
+            if next_at:
+                wait = (next_at - dt.datetime.now()).total_seconds()
+                if wait > 0:
+                    select.select([rfd], [], [], wait)
+                    drain()
+            else:
+                select.select([rfd], [], [], 60)
+                drain()
+    finally:
+        signal.set_wakeup_fd(old_wakeup)
+
+
+# ------------------------------------------------------------------ 菜单
+ITEMS = [
+    ("status",  "查看自动备份状态"),
+    ("manual",  "手动备份（执行 / 补传）"),
+    ("list",    "查看本地/远端备份明细"),
+    ("vms",     "管理虚拟机备份（增删改）"),
+    ("edit",    "修改全局配置"),
+    ("service", "服务管理（启用 / 注册 / 卸载）"),
+    ("quit",    "退出"),
+]
+
+
+def manual_menu(cfg: dict) -> None:
+    idx = pick("手动备份", [
+        "执行一次完整备份 + 上传",
+        "只补传本地未上传的备份",
+        "返回",
+    ])
+    if idx == 0:
+        act_run(cfg)
+    elif idx == 1:
+        act_upload(cfg)
+
+
+def service_menu(cfg: dict) -> None:
+    while True:
+        total = sum(1 for v in cfg["vms"]
+                    if str(cfg["vms"][v].get("enabled", "1")).strip() != "0")
+        auto = str(cfg["global"].get("auto_enabled", "1")) == "1"
+        running = run_capture(["systemctl", "is-active", DAEMON_UNIT]) == "active"
+
+        if total == 0:
+            state = "未配置虚拟机"
+            toggle_label = "开启自动备份"
+            is_on = False
+        elif auto and running:
+            state = "已开启（调度服务运行中）"
+            toggle_label = "关闭自动备份"
+            is_on = True
+        elif auto:
+            state = "已启用但服务未运行"
+            toggle_label = "关闭自动备份"
+            is_on = True
+        else:
+            state = "已关闭"
+            toggle_label = "开启自动备份"
+            is_on = False
+
+        idx = pick(f"服务管理（当前：{state}）", [
+            toggle_label,
+            "重新注册备份服务",
+            "重置调度状态",
+            "卸载备份服务",
+            "返回",
+        ])
+        if idx is None or idx == 4:
+            return
+
+        if idx == 0:
+            if is_on:
+                cfg["global"]["auto_enabled"] = "0"
+                save_conf(cfg)
+                sync_service(cfg)
+                print("已关闭自动备份（手动备份仍可用）")
+            else:
+                cfg["global"]["auto_enabled"] = "1"
+                save_conf(cfg)
+                sync_service(cfg)
+                print("已开启自动备份（调度服务常驻运行）")
+        elif idx == 1:
+            do_install(cfg, argparse.Namespace(url=None, user=None, passwd=None,
+                                               force=True, no_timer=False, vmid=None,
+                                               preserve_state=True))
+        elif idx == 2:
+            do_reset()
+        elif idx == 3:
+            if confirm("确认卸载备份服务？配置和备份会保留", "是，卸载", "否，取消"):
+                do_uninstall()
+
+        try:
+            input("\n按回车返回...")
+        except (EOFError, KeyboardInterrupt):
+            return
+
+
+def _dispatch(key: str, cfg: dict) -> None:
+    if key == "status":
+        act_status(cfg)
+    elif key == "manual":
+        manual_menu(cfg)
+    elif key == "list":
+        act_list(cfg)
+    elif key == "vms":
+        interactive_vm_menu(cfg)
+    elif key == "config":
+        act_config(cfg)
+    elif key == "edit":
+        edit_global_config(cfg)
+    elif key == "service":
+        service_menu(cfg)
+
+
+def interactive_menu() -> None:
+    while True:
+        idx = pick("PVE 备份管理", [label for _, label in ITEMS])
+        if idx is None:
+            break
+        key = ITEMS[idx][0]
+        if key == "quit":
+            break
+        cfg = load_conf()
+        try:
+            _dispatch(key, cfg)
+        except Exception as e:
+            print(f"\n执行出错: {e}")
+        try:
+            input("\n按回车返回菜单...")
+        except (EOFError, KeyboardInterrupt):
+            break
+
+
+def plain_menu() -> None:
+    while True:
+        section("PVE 备份管理")
+        for i, (_, label) in enumerate(ITEMS, 1):
+            print(f"  {i}) {label}")
+        print("")
+        try:
+            c = input("请选择: ").strip()
+        except (EOFError, KeyboardInterrupt):
+            return
+        if c in ("0", "q", "Q"):
+            return
+        if not c.isdigit() or not (1 <= int(c) <= len(ITEMS)):
+            print("无效选择")
+            continue
+        key = ITEMS[int(c) - 1][0]
+        if key == "quit":
+            return
+        cfg = load_conf()
+        try:
+            _dispatch(key, cfg)
+        except Exception as e:
+            print(f"执行出错: {e}")
+        try:
+            input("\n按回车返回菜单...")
+        except (EOFError, KeyboardInterrupt):
+            return
+
+
+# ------------------------------------------------------------------ CLI
+def build_install_parser() -> argparse.ArgumentParser:
+    ap = argparse.ArgumentParser(prog="pve-backup install")
+    ap.add_argument("--vmid", help="要加入备份的 VMID，多个用空格分隔")
+    ap.add_argument("--mode", choices=["snapshot", "suspend", "stop"])
+    ap.add_argument("--compress", choices=["zstd", "gzip", "lzo", "0"])
+    ap.add_argument("--prune")
+    ap.add_argument("--subdir")
+    ap.add_argument("--paths", help="多个远端基础目录，逗号分隔")
+    ap.add_argument("--host", help="远端主机子目录名（默认系统主机名）")
+    ap.add_argument("--keep", help="保留最新 N 个时间文件夹")
+    ap.add_argument("--url")
+    ap.add_argument("--user")
+    ap.add_argument("--pass", dest="passwd")
+    ap.add_argument("--force", action="store_true")
+    ap.add_argument("--no-timer", action="store_true")
+    return ap
+
+
+def print_help() -> None:
+    print(__doc__)
+
+
+def main() -> int:
+    if os.geteuid() != 0:
+        print("需要 root 权限", file=sys.stderr)
+        return 1
+
+    argv = sys.argv[1:]
+    if not argv:
+        if not require_rclone():
+            return 1
+        if sys.stdin.isatty() and sys.stdout.isatty():
+            interactive_menu()
+        else:
+            act_status(load_conf())
+        return 0
+
+    cmd, rest = argv[0], argv[1:]
+    cfg = load_conf()
+
+    if cmd in ("help", "-h", "--help"):
+        print_help()
+        return 0
+    if cmd == "menu":
+        if not require_rclone():
+            return 1
+        interactive_menu()
+        return 0
+    if cmd == "status":
+        act_status(cfg)
+        return 0
+    if cmd == "run":
+        return act_run(cfg, rest[0] if rest else None)
+    if cmd == "daemon":
+        return cmd_daemon()
+    if cmd == "upload":
+        return act_upload(cfg)
+    if cmd == "list":
+        act_list(cfg)
+        return 0
+    if cmd == "config":
+        act_config(cfg)
+        return 0
+    if cmd == "vms":
+        show_vm_table(cfg)
+        return 0
+    if cmd == "add":
+        a = parse_vm_options(rest)
+        add_vm(cfg, a["vmid"], vm_values_from_args(a), overwrite=False)
+        return 0
+    if cmd == "edit":
+        a = parse_vm_options(rest)
+        if str(a["vmid"]) not in cfg["vms"]:
+            print(f"VMID {a['vmid']} 不在配置中，使用 add 添加")
+            return 1
+        add_vm(cfg, a["vmid"], vm_values_from_args(a), overwrite=True)
+        return 0
+    if cmd == "remove":
+        if not rest:
+            print("用法: pve-backup remove <vmid>")
+            return 2
+        remove_vm(cfg, rest[0])
+        return 0
+    if cmd == "install":
+        args = build_install_parser().parse_args(rest)
+        return 0 if do_install(cfg, args) else 1
+    if cmd == "reset":
+        do_reset()
+        return 0
+    if cmd == "uninstall":
+        do_uninstall()
+        return 0
+
+    print(f"未知命令: {cmd}")
+    print_help()
+    return 2
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main())
+    except KeyboardInterrupt:
+        print("\n已取消")
+        sys.exit(130)

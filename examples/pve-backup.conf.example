@@ -1,0 +1,33 @@
+# pve-backup 配置示例：复制到 /etc/pve-backup.conf 后按需修改
+# 每台虚拟机对应一个 [vm:VMID] 段，留空的字段继承 [global]
+[global]
+storage = local
+dumpdir = /var/lib/vz/dump
+mode = snapshot
+compress = zstd
+local_prune = keep-last=3
+remote = webdav
+host_name = pve-node1
+remote_paths = cloud/pve-backup, nas/pve-backup
+remote_keep = 6
+delete_local = 0
+verify_hash = 0
+schedule = monthly 1 00:00
+auto_enabled = 1
+rclone_retries = 5
+rclone_timeout = 10m
+
+[vm:100]
+enabled = 1
+mode = snapshot
+compress = zstd
+local_prune = keep-last=2
+delete_local = 1
+
+[vm:101]
+enabled = 1
+mode = snapshot
+compress = gzip
+local_prune = keep-last=2
+delete_local = 1
+

@@ -1,0 +1,12 @@
+__pycache__/
+*.pyc
+*.pyo
+.DS_Store
+*.log
+*.swp
+
+# 运行时/敏感配置
+/etc/pve-backup.conf
+pve-backup.conf
+rclone.conf
+*.conf.bak

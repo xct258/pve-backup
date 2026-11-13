@@ -1,0 +1,16 @@
+[Unit]
+Description=PVE backup scheduler (daemon)
+Wants=network-online.target
+After=network-online.target pve-cluster.service pvestatd.service
+
+[Service]
+Type=simple
+ExecStart=/usr/local/sbin/pve-backup daemon
+Restart=always
+RestartSec=10
+Nice=10
+IOSchedulingClass=best-effort
+IOSchedulingPriority=7
+
+[Install]
+WantedBy=multi-user.target

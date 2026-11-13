@@ -1,0 +1,9 @@
+/var/log/pve-backup.log {
+    weekly
+    rotate 8
+    missingok
+    notifempty
+    compress
+    copytruncate
+    su root root
+}
