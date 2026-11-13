@@ -14,6 +14,7 @@ Proxmox VE 多虚拟机备份 + WebDAV 远传工具（单文件 Python，无需�
 - **幂等补传**：`upload` 子命令扫描本地未上传的归档，大小一致则跳过，适合失败后重试
 - **交互菜单**：`pve-backup` 无参数启动全屏仪表盘（顶部实时状态 + 分组菜单 + 内嵌弹层），无终端时自动降级为状态输出
 - **自检查**：`status` 展示调度时间、下次执行、远端连通性、虚拟机表与最近日志
+- **自动快照**：每台 VM 可单独设置计划（每小时/每 6 小时/每天/每周），按计划创建 Proxmox 快照并按保留份数清理旧的自动快照
 - **完成推送**：可选把每次运行结果推送到 [push-server](https://push-server.o1-1.xct258.top)（`POST /api/push`），支持只在失败时推送
 
 ## 环境要求
@@ -68,6 +69,7 @@ chmod +x pve-backup
 | `pve-backup list` | 列出本地与远端备份明细 |
 | `pve-backup vms` | 列出配置中的虚拟机及参数 |
 | `pve-backup notify [文本]` | 发送一条测试推送 |
+| `pve-backup snapshot [vmid]` | 按计划创建自动快照（定时器调用） |
 | `pve-backup add <vmid> [选项]` | 添加虚拟机 |
 | `pve-backup edit <vmid> [选项]` | 修改虚拟机参数 |
 | `pve-backup remove <vmid>` | 从配置移除虚拟机（不删备份文件） |
@@ -100,6 +102,11 @@ auto_enabled = 1                # 自动调度开关
 rclone_retries = 5
 rclone_timeout = 10m
 
+# 自动快照
+snapshot_enabled = 0            # 总开关
+snapshot_schedule = daily 04:00 # 默认计划（新加的 VM 用）
+snapshot_keep = 3               # 默认保留份数
+
 # 推送通知（push-server）
 notify_url = https://push-server.o1-1.xct258.top
 notify_topic = server/pve-backup
@@ -122,6 +129,8 @@ enabled = 1
 
 [vm:100]
 enabled = 1
+snapshot_schedule = daily 03:00  # 可选：该 VM 自动快照计划，不写则不参与
+snapshot_keep = 2                # 可选：该 VM 保留份数
 mode = snapshot
 compress = zstd
 local_prune = keep-last=2
@@ -208,6 +217,25 @@ delete_local = 1
 - 备份/补传这类长任务会临时切回普通终端输出进度，结束按回车回到仪表盘。
 - 终端小于 52x16 时显示提示，建议放大窗口。
 - 非交互环境（管道、cron、`ssh` 无 TTY）仍然只输出状态文本。
+
+## 自动快照
+
+为虚拟机制作 Proxmox 快照，适合「升级前回滚点」这类需求；与备份互相独立，不占用远端空间。
+
+- 每台 VM 单独设置计划，同一计划共用一个 `pve-backup-snapshot-<hash>.timer`
+- 计划支持：每小时整点、每 6 小时、每天指定时间、每周指定时间（也接受原生日历表达式）
+- 快照名 `auto-YYYYmmdd-HHMMSS`，只清理这个前缀的快照，手动快照不动
+- 保留份数按 VM 计算，`0` 表示不清理
+- 管理入口：全局参数 → 自动快照（总开关、逐台设置、立即执行），虚拟机参数页也能直接改
+- 定时器执行 `pve-backup snapshot`，通过环境变量 `PVE_SNAPSHOT_SCHEDULE` 只处理对应计划
+- 依赖 `qm`（Proxmox VE）；存储需要支持快照（qcow2 / LVM-thin 等），不支持时会在结果里报错
+
+手动执行：
+
+```bash
+pve-backup snapshot          # 所有配置了计划的 VM
+pve-backup snapshot 100      # 只处理 100
+```
 
 ## 推送通知
 

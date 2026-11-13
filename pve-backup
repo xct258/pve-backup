@@ -14,6 +14,7 @@ pve-backup —— PVE 多虚拟机备份 + WebDAV 上传（Python 单文件版�
   pve-backup                     交互式菜单
   pve-backup status              查看自动备份状态
   pve-backup run [vmid]          备份（不指定 vmid 则备份全部已启用虚拟机）
+  pve-backup snapshot [vmid]     按计划创建 VM 快照
   pve-backup upload              只补传本地未上传的备份
   pve-backup list                列出本地/远端备份明细
   pve-backup vms                 列出已配置的虚拟机及其参数
@@ -102,6 +103,10 @@ GLOBAL_DEFAULTS = {
     "notify_topic": "server/pve-backup",
     "notify_on": "always",
     "notify_timeout": "10",
+    # 自动快照
+    "snapshot_enabled": "0",
+    "snapshot_schedule": "daily 04:00",
+    "snapshot_keep": "3",
 }
 
 # 每台虚拟机可覆盖的字段（空字符串表示继承全局）
@@ -667,6 +672,99 @@ def save_conf(cfg: dict) -> None:
     notify_daemon()
 
 
+def _plain_snapshot_schedule(current: str = "") -> str | None:
+    """文本界面的计划选择，返回 None 取消、'' 表示关闭。"""
+    idx = pick("快照计划", [
+        "每小时整点",
+        "每 6 小时（00/06/12/18 点）",
+        "每天指定时间",
+        "每周指定时间",
+        "关闭自动快照",
+        "返回",
+    ])
+    if idx is None or idx == 5:
+        return None
+    if idx == 4:
+        return ""
+    if idx == 0:
+        return "*-*-* *:00:00"
+    if idx == 1:
+        return "*-*-* 00,06,12,18:00:00"
+    if idx == 2:
+        try:
+            clock = input("时间（HH:MM）: ").strip()
+        except (EOFError, KeyboardInterrupt):
+            return None
+        match = re.fullmatch(r"(\d{1,2}):(\d{2})", clock)
+        if not match or int(match.group(1)) > 23 or int(match.group(2)) > 59:
+            print("时间格式不正确")
+            return None
+        return f"daily {int(match.group(1)):02d}:{int(match.group(2)):02d}"
+    days = ["mon", "tue", "wed", "thu", "fri", "sat", "sun"]
+    di = pick("星期", ["周一", "周二", "周三", "周四", "周五", "周六", "周日", "返回"])
+    if di is None or di == 7:
+        return None
+    try:
+        clock = input("时间（HH:MM）: ").strip()
+    except (EOFError, KeyboardInterrupt):
+        return None
+    match = re.fullmatch(r"(\d{1,2}):(\d{2})", clock)
+    if not match or int(match.group(1)) > 23 or int(match.group(2)) > 59:
+        print("时间格式不正确")
+        return None
+    return f"weekly {days[di]} {int(match.group(1)):02d}:{int(match.group(2)):02d}"
+
+
+def edit_snapshot_interactive(cfg: dict) -> None:
+    while True:
+        vms = sorted(cfg["vms"], key=lambda x: int(x) if x.isdigit() else 0)
+        if not vms:
+            print("尚未配置虚拟机")
+            return
+        guests = guest_map()
+        opts = []
+        for vmid in vms:
+            spec = vm_snapshot_schedule(cfg, vmid)
+            text = snapshot_schedule_text(spec) if spec else "关闭"
+            name = guests.get(vmid, {}).get("name", "-")
+            opts.append(f"{vmid}  {name}  {text}  保留 {vm_snapshot_keep(cfg, vmid)}")
+        opts.append("返回")
+        idx = pick("自动快照", opts)
+        if idx is None or idx == len(vms):
+            return
+        vmid = vms[idx]
+        vm = cfg["vms"].setdefault(vmid, {"enabled": "1"})
+        act = pick(f"VM {vmid} 自动快照", [
+            "设置计划", "设置保留份数", "立即创建快照", "返回"])
+        if act is None or act == 3:
+            continue
+        if act == 0:
+            new = _plain_snapshot_schedule(vm_snapshot_schedule(cfg, vmid))
+            if new is None:
+                continue
+            if new:
+                vm["snapshot_schedule"] = new
+            else:
+                vm.pop("snapshot_schedule", None)
+            save_conf(cfg)
+            sync_snapshot_timers(cfg)
+            print("已保存")
+        elif act == 1:
+            try:
+                value = input(f"保留份数（当前 {vm_snapshot_keep(cfg, vmid)}，0 不清理）: ").strip()
+            except (EOFError, KeyboardInterrupt):
+                continue
+            if value:
+                vm["snapshot_keep"] = value
+            else:
+                vm.pop("snapshot_keep", None)
+            save_conf(cfg)
+            print("已保存")
+        elif act == 2:
+            act_snapshot(cfg, vmid)
+            pause()
+
+
 def target_params(cfg: dict, vmid: str, guests: dict = None) -> dict:
     """返回某台虚拟机的生效参数（未设置的继承全局）。名称始终来自 PVE。"""
     g = cfg["global"]
@@ -976,6 +1074,213 @@ def enforce_folder_keep(cfg: dict):
                 removed += 1
         msgs.append(f"{base}: 删除 {removed} 个，保留 {len(dirs) - removed} 个")
     return "；".join(msgs) if msgs else None
+
+
+# ------------------------------------------------------------------ 自动快照
+SNAP_PREFIX = "auto-"
+SNAP_UNIT_PREFIX = "pve-backup-snapshot"
+
+
+def _snap_tag(spec: str) -> str:
+    return hashlib.md5(spec.encode("utf-8")).hexdigest()[:8]
+
+
+def vm_snapshot_schedule(cfg: dict, vmid) -> str:
+    vm = cfg.get("vms", {}).get(str(vmid), {})
+    return str(vm.get("snapshot_schedule", "") or "").strip()
+
+
+def vm_snapshot_keep(cfg: dict, vmid) -> str:
+    vm = cfg.get("vms", {}).get(str(vmid), {})
+    value = str(vm.get("snapshot_keep", "") or "").strip()
+    return value or str(cfg["global"].get("snapshot_keep", "3") or "").strip()
+
+
+def snapshot_schedule_text(spec: str) -> str:
+    spec = str(spec or "").strip()
+    if spec == "*-*-* *:00:00":
+        return "每小时整点"
+    if spec == "*-*-* 00,06,12,18:00:00":
+        return "每 6 小时"
+    return schedule_text(spec)
+
+
+def snapshot_groups(cfg: dict) -> dict:
+    """按计划分组：{oncalendar: [vmid, ...]}"""
+    groups = {}
+    for vmid in cfg.get("vms", {}):
+        spec = vm_snapshot_schedule(cfg, vmid)
+        if spec:
+            groups.setdefault(spec, []).append(str(vmid))
+    return groups
+
+
+def vm_auto_snapshots(vmid) -> list:
+    node = socket.gethostname()
+    raw = run_capture(["pvesh", "get", f"/nodes/{node}/qemu/{vmid}/snapshot",
+                       "--output-format", "json"])
+    try:
+        data = json.loads(raw or "[]")
+    except ValueError:
+        return []
+    names = []
+    for item in data:
+        name = str(item.get("name", "") or "")
+        if name and name != "current":
+            names.append(name)
+    return names
+
+
+def act_snapshot(cfg: dict, only=None, schedule=None) -> int:
+    """为配置了自动快照的虚拟机创建快照并按保留份数清理。"""
+    if not shutil.which("qm"):
+        print("错误: 未找到 qm，本机不是 Proxmox VE")
+        return 1
+
+    if only:
+        vmid = str(only)
+        if vmid not in cfg.get("vms", {}):
+            print(f"错误: VMID {vmid} 不在配置中")
+            return 1
+        targets = [vmid]
+    else:
+        targets = []
+        for vmid in sorted(cfg.get("vms", {}),
+                           key=lambda x: int(x) if x.isdigit() else 0):
+            spec = vm_snapshot_schedule(cfg, vmid)
+            if not spec:
+                continue
+            if schedule and spec != schedule:
+                continue
+            targets.append(str(vmid))
+    if not targets:
+        print("没有需要自动快照的虚拟机")
+        return 0
+
+    stamp = dt.datetime.now().strftime("%Y%m%d-%H%M%S")
+    name = f"{SNAP_PREFIX}{stamp}"
+    ok = fail = pruned = 0
+    for vmid in targets:
+        proc = subprocess.run(
+            ["qm", "snapshot", vmid, name, "--description", "pve-backup 自动快照"],
+            capture_output=True, text=True)
+        if proc.returncode != 0:
+            detail = (proc.stderr or proc.stdout).strip()[:300]
+            print(f"VM {vmid}: 创建快照失败 - {detail}")
+            fail += 1
+            continue
+        ok += 1
+        keep = vm_snapshot_keep(cfg, vmid)
+        if not keep.isdigit() or int(keep) <= 0:
+            continue
+        autos = sorted(n for n in vm_auto_snapshots(vmid)
+                       if n.startswith(SNAP_PREFIX))
+        for old in autos[:-int(keep)]:
+            if subprocess.run(["qm", "delsnapshot", vmid, old],
+                              capture_output=True).returncode == 0:
+                pruned += 1
+        print(f"VM {vmid}: 已创建 {name}")
+
+    print(f"自动快照完成：成功 {ok}，失败 {fail}"
+          + (f"，清理旧快照 {pruned}" if pruned else ""))
+    return 0 if fail == 0 else 1
+
+
+SNAP_SERVICE_TEXT = """[Unit]
+Description=PVE automatic VM snapshots ({schedule})
+After=pve-cluster.service pvestatd.service
+
+[Service]
+Type=oneshot
+Environment="PVE_SNAPSHOT_SCHEDULE={schedule}"
+ExecStart={script} snapshot
+Nice=10
+IOSchedulingClass=best-effort
+IOSchedulingPriority=7
+"""
+
+SNAP_TIMER_TEXT = """[Unit]
+Description=PVE automatic VM snapshot timer ({schedule})
+
+[Timer]
+OnCalendar={oncalendar}
+Persistent=true
+RandomizedDelaySec=300
+
+[Install]
+WantedBy=timers.target
+"""
+
+
+def _write_unit_file(path: str, text: str) -> bool:
+    try:
+        with open(path, encoding="utf-8") as f:
+            if f.read() == text:
+                return False
+    except OSError:
+        pass
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(text)
+    os.chmod(path, 0o644)
+    return True
+
+
+def sync_snapshot_timers(cfg: dict) -> None:
+    """按每个计划重建 systemd timer（同一计划共用一个单元）。"""
+    enabled = str(cfg["global"].get("snapshot_enabled", "0")).strip() == "1"
+    groups = snapshot_groups(cfg) if enabled else {}
+    wanted = set()
+    changed = False
+    for spec in groups:
+        try:
+            oncalendar = normalize_schedule(spec)
+        except ValueError as exc:
+            print(f"快照计划无效，跳过 {spec}: {exc}")
+            continue
+        tag = _snap_tag(spec)
+        svc = os.path.join(UNIT_DIR, f"{SNAP_UNIT_PREFIX}-{tag}.service")
+        tmr = os.path.join(UNIT_DIR, f"{SNAP_UNIT_PREFIX}-{tag}.timer")
+        wanted.add(os.path.basename(svc))
+        wanted.add(os.path.basename(tmr))
+        changed |= _write_unit_file(svc, SNAP_SERVICE_TEXT.format(
+            schedule=spec, script=SELF_PATH))
+        changed |= _write_unit_file(tmr, SNAP_TIMER_TEXT.format(
+            oncalendar=oncalendar, schedule=spec))
+
+    for path in glob.glob(os.path.join(UNIT_DIR, f"{SNAP_UNIT_PREFIX}-*")):
+        name = os.path.basename(path)
+        if name in wanted:
+            continue
+        if name.endswith(".timer"):
+            subprocess.run(["systemctl", "disable", "--now", name],
+                           capture_output=True)
+        try:
+            os.remove(path)
+            changed = True
+        except OSError:
+            pass
+
+    if changed:
+        subprocess.run(["systemctl", "daemon-reload"], capture_output=True)
+    for name in sorted(wanted):
+        if name.endswith(".timer"):
+            subprocess.run(["systemctl", "enable", "--now", name],
+                           capture_output=True)
+
+
+def snapshot_timer_summary(cfg: dict) -> str:
+    groups = snapshot_groups(cfg)
+    if not groups:
+        return "无计划"
+    total = len(groups)
+    active = 0
+    for spec in groups:
+        tag = _snap_tag(spec)
+        out = run_capture(["systemctl", "is-active",
+                           f"{SNAP_UNIT_PREFIX}-{tag}.timer"])
+        if out == "active":
+            active += 1
+    return f"{active}/{total} 个定时器运行"
 
 
 # ------------------------------------------------------------------ 状态
@@ -1673,6 +1978,7 @@ def edit_vm_interactive(cfg: dict, vmid: str) -> None:
             ("delete_local", f"上传后删本地: {p['delete_local']}"),
             ("verify_hash", f"SHA256 校验: {p['verify_hash']}"),
             ("remotes", f"云端备份目录: {remotes_txt}"),
+            ("snapshot", f"自动快照: {snapshot_schedule_text(vm_snapshot_schedule(cfg, vmid)) if vm_snapshot_schedule(cfg, vmid) else '关闭'}"),
             ("enabled", f"启用: {'1' if p['enabled'] else '0'}"),
         ]
         idx = pick(f"修改 VM {vmid}（{p['name'] or '-'}）参数",
@@ -1687,6 +1993,17 @@ def edit_vm_interactive(cfg: dict, vmid: str) -> None:
 
         if key == "remotes":
             edit_vm_remotes_interactive(cfg, vmid)
+            continue
+
+        if key == "snapshot":
+            new = _plain_snapshot_schedule(vm_snapshot_schedule(cfg, vmid))
+            if new is not None:
+                if new:
+                    vm["snapshot_schedule"] = new
+                else:
+                    vm.pop("snapshot_schedule", None)
+                save_conf(cfg)
+                sync_snapshot_timers(cfg)
             continue
 
         if key == "mode":
@@ -1783,6 +2100,7 @@ def edit_global_config(cfg: dict) -> None:
             ("webdav", "WebDAV 连接（地址/账号/密码）"),
             ("host_name", f"远端主机子目录: {g.get('host_name') or host_label(cfg)}"),
             ("remotes", f"远端目录管理（{len(remote_entries(cfg))} 个，各自保留）"),
+            ("snapshots", f"自动快照（{sum(len(v) for v in snapshot_groups(cfg).values())} 台）"),
             ("mode", f"默认备份模式: {g.get('mode')}"),
             ("compress", f"默认压缩: {g.get('compress')}"),
             ("local_prune", f"默认本机保留: {g.get('local_prune')}"),
@@ -1800,6 +2118,10 @@ def edit_global_config(cfg: dict) -> None:
 
         if key == "remotes":
             edit_remotes_interactive(cfg)
+            continue
+
+        if key == "snapshots":
+            edit_snapshot_interactive(cfg)
             continue
 
         if key == "mode":
@@ -1869,11 +2191,12 @@ def sync_service(cfg: dict) -> None:
                 os.remove(path)
             except OSError:
                 pass
-    for link in glob.glob(os.path.join(UNIT_DIR, "timers.target.wants", "pve-backup-*.timer")):
-        try:
-            os.remove(link)
-        except OSError:
-            pass
+    for pattern in ("pve-backup-vm*.timer", "pve-backup-webdav*.timer"):
+        for link in glob.glob(os.path.join(UNIT_DIR, "timers.target.wants", pattern)):
+            try:
+                os.remove(link)
+            except OSError:
+                pass
     for name in stale_units + [SERVICE_NAME, TIMER_NAME]:
         subprocess.run(["systemctl", "reset-failed", name], capture_output=True)
 
@@ -1884,6 +2207,8 @@ def sync_service(cfg: dict) -> None:
         subprocess.run(["systemctl", "enable", "--now", DAEMON_UNIT], capture_output=True)
     else:
         subprocess.run(["systemctl", "disable", "--now", DAEMON_UNIT], capture_output=True)
+
+    sync_snapshot_timers(cfg)
 
 
 def write_logrotate() -> None:
@@ -1974,6 +2299,7 @@ def do_install(cfg: dict, args) -> bool:
     say(f"  [4/6] 已生成日志轮转: {LOGROTATE_FILE}")
 
     sync_service(cfg)
+    sync_snapshot_timers(cfg)
     n = len(cfg["vms"])
     say(f"  [5/6] 已生成调度服务（{n} 个备份计划）")
 
@@ -2011,16 +2337,25 @@ def do_uninstall() -> None:
     section("注销 PVE 备份服务")
     subprocess.run(["systemctl", "disable", "--now", DAEMON_UNIT], capture_output=True)
     subprocess.run(["systemctl", "disable", "--now", TIMER_NAME], capture_output=True)
+    for path in glob.glob(os.path.join(UNIT_DIR, f"{SNAP_UNIT_PREFIX}-*")):
+        if path.endswith(".timer"):
+            subprocess.run(["systemctl", "disable", "--now",
+                            os.path.basename(path)], capture_output=True)
+        try:
+            os.remove(path)
+        except OSError:
+            pass
     for path in glob.glob(os.path.join(UNIT_DIR, "pve-backup-vm*.*")):
         try:
             os.remove(path)
         except OSError:
             pass
-    for link in glob.glob(os.path.join(UNIT_DIR, "timers.target.wants", "pve-backup-*.timer")):
-        try:
-            os.remove(link)
-        except OSError:
-            pass
+    for pattern in ("pve-backup-vm*.timer", "pve-backup-webdav*.timer"):
+        for link in glob.glob(os.path.join(UNIT_DIR, "timers.target.wants", pattern)):
+            try:
+                os.remove(link)
+            except OSError:
+                pass
     for f in (os.path.join(UNIT_DIR, DAEMON_UNIT),
               os.path.join(UNIT_DIR, SERVICE_NAME),
               os.path.join(UNIT_DIR, TIMER_NAME),
@@ -2257,23 +2592,53 @@ def _ui_msg(scr, title, text, wait="按任意键返回") -> None:
             return
 
 
-def _ui_choice(scr, title, options, default=0):
+def _ui_fit(text, cells: int) -> str:
+    out = []
+    used = 0
+    for ch in str(text):
+        cw = 2 if unicodedata.east_asian_width(ch) in "WF" else 1
+        if used + cw > cells:
+            break
+        out.append(ch)
+        used += cw
+    return "".join(out)
+
+
+def _ui_choice(scr, title, options, default=0, info=None):
     if not options:
         return None
+    info = list(info or [])
     pos = min(max(default, 0), len(options) - 1)
     while True:
         h, w = scr.getmaxyx()
-        bw = min(w - 4, max(36, max([_ui_width(o) for o in options] + [_ui_width(title)]) + 8))
-        bh = min(h - 2, len(options) + 4)
+        rows = max(3, h - 9 - len(info))
+        start = max(0, min(pos - rows // 2, len(options) - rows))
+        visible = options[start:start + rows]
+        bw = min(w - 4, max(36, max([_ui_width(o) for o in options]
+                                    + [_ui_width(title)]
+                                    + [_ui_width(x) for x in info]) + 8))
+        bh = min(h - 2, len(info) + len(visible) + 5)
         y0 = max(0, (h - bh) // 2)
         x0 = max(0, (w - bw) // 2)
         scr.erase()
         _ui_box(scr, y0, x0, bh, bw, title)
-        for i, opt in enumerate(options):
-            attr = curses.A_REVERSE if i == pos else 0
-            _ui_add(scr, y0 + 2 + i, x0 + 2,
-                    " " + pad(opt, bw - 6) + " ", attr)
-        _ui_add(scr, y0 + bh - 1, x0 + 2, " ↑/↓ 选择  Enter 确认  q 取消 ")
+        y = y0 + 1
+        for line in info:
+            if y >= y0 + bh - 3:
+                break
+            _ui_add(scr, y, x0 + 2, "  " + _ui_fit(line, bw - 4), curses.A_DIM)
+            y += 1
+        if info:
+            y += 1
+        for i, opt in enumerate(visible):
+            real = start + i
+            attr = curses.A_REVERSE if real == pos else 0
+            _ui_add(scr, y, x0 + 2,
+                    " " + pad(_ui_fit(opt, bw - 6), bw - 6) + " ", attr)
+            y += 1
+        footer = ("↑/↓ 选择  Enter 确认  q 取消" if len(options) <= rows
+                  else f"{pos + 1}/{len(options)}  ↑/↓ 选择  Enter 确认  q 取消")
+        _ui_add(scr, y0 + bh - 1, x0 + 2, " " + _ui_fit(footer, bw - 4) + " ")
         scr.refresh()
         ch = _ui_key(scr)
         if isinstance(ch, int):
@@ -2281,6 +2646,10 @@ def _ui_choice(scr, title, options, default=0):
                 pos = (pos - 1) % len(options)
             elif ch == curses.KEY_DOWN:
                 pos = (pos + 1) % len(options)
+            elif ch == curses.KEY_HOME:
+                pos = 0
+            elif ch == curses.KEY_END:
+                pos = len(options) - 1
             elif ch in (10, 13, curses.KEY_ENTER):
                 return pos
             elif ch in (27, ord("q")):
@@ -2455,6 +2824,15 @@ def _ui_move(rows, sel, step) -> int:
     return sel
 
 
+def _ui_snapshot_line(cfg) -> str:
+    groups = snapshot_groups(cfg)
+    if not groups:
+        return "未配置"
+    count = sum(len(v) for v in groups.values())
+    state = "开启" if str(cfg["global"].get("snapshot_enabled", "0")) == "1" else "关闭"
+    return f"{state} · {count} 台 · {len(groups)} 种计划"
+
+
 def _ui_header(info) -> list:
     g = info["cfg"]["global"]
     auto = info["auto"]
@@ -2474,6 +2852,7 @@ def _ui_header(info) -> list:
         ("自动备份", f"{auto_txt} · {info['schedule']} · 下次 {info['next']}", 0),
         ("调度服务", svc, svc_attr),
         ("虚拟机", f"{info['vms']} 台（启用 {info['vms_on']}）", 0),
+        ("自动快照", _ui_snapshot_line(info["cfg"]), 0),
         ("远端", f"{info['remote']} → {info['paths'] or '未配置'}", 0),
         ("推送", push, 0),
     ]
@@ -2593,9 +2972,136 @@ def _ui_vm_remotes(scr, vmid) -> None:
         _ui_bust()
 
 
+def _ui_snap_time(scr, title="时间（HH:MM）", default="04:00"):
+    value = _ui_input(scr, title, default, "24 小时制，如 04:30")
+    if value is None:
+        return None
+    match = re.fullmatch(r"(\d{1,2}):(\d{2})", value.strip())
+    if not match:
+        _ui_msg(scr, "格式错误", "时间格式应为 HH:MM")
+        return None
+    hour, minute = int(match.group(1)), int(match.group(2))
+    if not (0 <= hour <= 23 and 0 <= minute <= 59):
+        _ui_msg(scr, "格式错误", "时间超出范围")
+        return None
+    return f"{hour:02d}:{minute:02d}"
+
+
+def _ui_pick_snapshot_schedule(scr, current=""):
+    opts = [
+        "每小时整点",
+        "每 6 小时（00/06/12/18 点）",
+        "每天指定时间",
+        "每周指定时间",
+        "关闭自动快照",
+        "返回",
+    ]
+    idx = _ui_choice(scr, "快照计划", opts)
+    if idx is None or idx == 5:
+        return None
+    if idx == 4:
+        return ""
+    if idx == 0:
+        return "*-*-* *:00:00"
+    if idx == 1:
+        return "*-*-* 00,06,12,18:00:00"
+    if idx == 2:
+        clock = _ui_snap_time(scr)
+        return f"daily {clock}" if clock else None
+    days = ["mon", "tue", "wed", "thu", "fri", "sat", "sun"]
+    di = _ui_choice(scr, "星期", ["周一", "周二", "周三", "周四",
+                                  "周五", "周六", "周日", "返回"])
+    if di is None or di == 7:
+        return None
+    clock = _ui_snap_time(scr)
+    return f"weekly {days[di]} {clock}" if clock else None
+
+
+def _ui_vm_snapshot_actions(scr, vmid) -> None:
+    while True:
+        cfg = load_conf()
+        spec = vm_snapshot_schedule(cfg, vmid)
+        keep = vm_snapshot_keep(cfg, vmid)
+        opts = [
+            f"计划        {snapshot_schedule_text(spec) if spec else '关闭'}",
+            f"保留份数    {keep or '不限'}",
+            "立即创建快照",
+            "返回",
+        ]
+        idx = _ui_choice(scr, f"VM {vmid} 自动快照", opts)
+        if idx is None or idx == 3:
+            return
+        vm = cfg["vms"].setdefault(vmid, {"enabled": "1"})
+        if idx == 0:
+            spec_new = _ui_pick_snapshot_schedule(scr, spec)
+            if spec_new is None:
+                continue
+            if spec_new:
+                vm["snapshot_schedule"] = spec_new
+            else:
+                vm.pop("snapshot_schedule", None)
+            save_conf(cfg)
+            sync_snapshot_timers(cfg)
+            _ui_bust()
+        elif idx == 1:
+            value = _ui_input(scr, "保留份数", keep, "0 表示不清理")
+            if value is None:
+                continue
+            if value.strip():
+                vm["snapshot_keep"] = value.strip()
+            else:
+                vm.pop("snapshot_keep", None)
+            save_conf(cfg)
+            _ui_bust()
+        elif idx == 2:
+            text = _ui_capture(act_snapshot, cfg, vmid)
+            _ui_pager(scr, f"VM {vmid} 快照结果", text)
+
+
+def _ui_snapshot_view(scr) -> None:
+    while True:
+        cfg = load_conf()
+        enabled = str(cfg["global"].get("snapshot_enabled", "0")) == "1"
+        vms = sorted(cfg["vms"], key=lambda x: int(x) if x.isdigit() else 0)
+        guests = guest_map()
+        rows = []
+        for vmid in vms:
+            name = (guests.get(vmid, {}).get("name") or "-")[:14]
+            spec = vm_snapshot_schedule(cfg, vmid)
+            text = snapshot_schedule_text(spec) if spec else "关闭"
+            rows.append(f"{vmid:<5} {name:<14} {text:<14} 保留 {vm_snapshot_keep(cfg, vmid)}")
+        opts = [("关闭自动快照" if enabled else "开启自动快照")] + rows
+        opts += ["立即执行一次（全部）", "返回"]
+        info = [
+            f"定时器  {snapshot_timer_summary(cfg)}",
+            "每台虚拟机可单独设置计划，同一计划共用一个 systemd timer",
+        ]
+        idx = _ui_choice(scr, "自动快照", opts, info=info)
+        if idx is None or idx == len(opts) - 1:
+            return
+        if idx == 0:
+            if not enabled and not snapshot_groups(cfg):
+                _ui_msg(scr, "无法开启", "请先给至少一台虚拟机设置快照计划")
+                continue
+            cfg["global"]["snapshot_enabled"] = "0" if enabled else "1"
+            save_conf(cfg)
+            sync_snapshot_timers(cfg)
+            _ui_bust()
+            continue
+        if idx == len(opts) - 2:
+            text = _ui_capture(act_snapshot, cfg)
+            _ui_pager(scr, "自动快照结果", text)
+            continue
+        _ui_vm_snapshot_actions(scr, vms[idx - 1])
+
+
+def _ui_snapshot_row(scr, vmid) -> None:
+    _ui_vm_snapshot_actions(scr, vmid)
+
+
 def _ui_vm_edit(scr, vmid) -> None:
     fields = ["mode", "compress", "local_prune", "delete_local",
-              "verify_hash", "remotes", "enabled"]
+              "verify_hash", "remotes", "snapshot", "enabled"]
     while True:
         cfg = load_conf()
         guests = guest_map()
@@ -2603,6 +3109,7 @@ def _ui_vm_edit(scr, vmid) -> None:
         n_rec = len(vm_remote_entries(cfg, vmid))
         remotes_txt = (f"自定义（{n_rec} 个）" if n_rec
                        else f"跟随全局（{len(remote_paths(cfg))} 个）")
+        snap_spec = vm_snapshot_schedule(cfg, vmid)
         opts = [
             f"备份模式        {p['mode']}",
             f"压缩算法        {p['compress']}",
@@ -2610,6 +3117,7 @@ def _ui_vm_edit(scr, vmid) -> None:
             f"上传后删本地    {'是' if p['delete_local'] == '1' else '否'}",
             f"SHA256 校验     {'是' if p['verify_hash'] == '1' else '否'}",
             f"云端备份目录    {remotes_txt}",
+            f"自动快照        {snapshot_schedule_text(snap_spec) if snap_spec else '关闭'}",
             f"启用备份        {'是' if p['enabled'] else '否'}",
             "完成并返回",
         ]
@@ -2620,6 +3128,9 @@ def _ui_vm_edit(scr, vmid) -> None:
         vm = cfg["vms"].setdefault(vmid, {"enabled": "1"})
         if key == "remotes":
             _ui_vm_remotes(scr, vmid)
+            continue
+        if key == "snapshot":
+            _ui_vm_snapshot_actions(scr, vmid)
             continue
         if key == "mode":
             v = _ui_choice(scr, "备份模式", ["snapshot（快照，不停机）",
@@ -2803,6 +3314,8 @@ def _ui_global_view(scr) -> None:
             f"压缩算法        {g.get('compress')}",
             f"本机保留        {g.get('local_prune')}",
             f"远端目录        {len(remote_entries(cfg))} 个（各自独立保留）",
+            f"自动快照        {'开启' if str(g.get('snapshot_enabled', '0')) == '1' else '关闭'}"
+            f"（{sum(len(v) for v in snapshot_groups(cfg).values())} 台）",
             f"主机标识        {g.get('host_name') or '(系统主机名)'}",
             f"推送时机        {g.get('notify_on')}",
             f"推送地址        {g.get('notify_url')}",
@@ -2843,21 +3356,24 @@ def _ui_global_view(scr) -> None:
             _ui_remotes_view(scr)
             continue
         elif idx == 5:
+            _ui_snapshot_view(scr)
+            continue
+        elif idx == 6:
             v = _ui_input(scr, "主机标识", g.get("host_name", ""),
                           "留空使用系统主机名")
             if v is not None:
                 g["host_name"] = v.strip()
-        elif idx == 6:
+        elif idx == 7:
             v = _ui_choice(scr, "推送时机", ["always（每次）", "failure（仅失败）",
                                              "never（关闭）"])
             if v is not None:
                 g["notify_on"] = ["always", "failure", "never"][v]
-        elif idx == 7:
+        elif idx == 8:
             v = _ui_input(scr, "推送地址", g.get("notify_url", ""),
                           "push-server 地址，留空关闭推送")
             if v is not None:
                 g["notify_url"] = v.strip()
-        elif idx == 8:
+        elif idx == 9:
             v = _ui_input(scr, "新目录默认保留", g.get("remote_keep", ""),
                           "新增远端目录时默认使用，0 表示不清理")
             if v is not None:
@@ -3227,6 +3743,10 @@ def main() -> int:
         return act_run(cfg, rest[0] if rest else None)
     if cmd == "daemon":
         return cmd_daemon()
+    if cmd == "snapshot":
+        return act_snapshot(
+            cfg, rest[0] if rest else None,
+            (os.environ.get("PVE_SNAPSHOT_SCHEDULE") or "").strip() or None)
     if cmd == "upload":
         return act_upload(cfg)
     if cmd == "list":
