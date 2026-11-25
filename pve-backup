@@ -1857,7 +1857,7 @@ def vm_values_from_args(a: dict) -> dict:
 
 # ------------------------------------------------------------------ 选择器
 def pick(title: str, options: list, default: int = 0,
-         footer: str = "↑/↓ 或 j/k 选择   Enter 确认   q 取消"):
+         footer: str = "↑/↓ 选择   Enter 确认   q 取消"):
     """上下键选择器；返回索引，取消返回 None。非终端环境退化为数字菜单。"""
     if not options:
         return None
@@ -1900,9 +1900,9 @@ def pick(title: str, options: list, default: int = 0,
             except Exception:
                 pass
             ch = stdscr.getch()
-            if ch in (curses.KEY_UP, ord("k")):
+            if ch == curses.KEY_UP:
                 pos = (pos - 1) % len(options)
-            elif ch in (curses.KEY_DOWN, ord("j")):
+            elif ch == curses.KEY_DOWN:
                 pos = (pos + 1) % len(options)
             elif ch in (10, 13, curses.KEY_ENTER):
                 return pos
@@ -2558,19 +2558,19 @@ def cmd_daemon() -> int:
 # ------------------------------------------------------------ 全屏仪表盘
 UI_GROUPS = [
     ("备份", [
-        ("run",     "立即备份（全部虚拟机）", "r"),
-        ("upload",  "补传未上传的备份",       "u"),
-        ("list",    "查看备份明细",           "l"),
+        ("run",     "立即备份（全部虚拟机）"),
+        ("upload",  "补传未上传的备份"),
+        ("list",    "查看备份明细"),
     ]),
     ("配置", [
-        ("vms",     "虚拟机管理",             "v"),
-        ("global",  "全局参数",               "g"),
+        ("vms",     "虚拟机管理"),
+        ("global",  "全局参数"),
     ]),
     ("系统", [
-        ("status",  "运行状态",               "s"),
-        ("notify",  "发送测试推送",           "p"),
-        ("service", "服务管理",               "m"),
-        ("quit",    "退出",                   "q"),
+        ("status",  "运行状态"),
+        ("notify",  "发送测试推送"),
+        ("service", "服务管理"),
+        ("quit",    "退出"),
     ]),
 ]
 
@@ -2757,8 +2757,6 @@ def _ui_choice(scr, title, options, default=0, info=None):
                 return pos
             elif ch in (27, ord("q")):
                 return None
-        elif ch in ("k", "j"):
-            pos = (pos + (-1 if ch == "k" else 1)) % len(options)
         elif ch in ("\n", "\r"):
             return pos
         elif ch in ("q", "\x1b"):
@@ -2907,8 +2905,8 @@ def _ui_rows() -> list:
     rows = []
     for group, items in UI_GROUPS:
         rows.append({"kind": "group", "label": group})
-        for key, label, hot in items:
-            rows.append({"kind": "item", "key": key, "label": label, "hot": hot})
+        for key, label in items:
+            rows.append({"kind": "item", "key": key, "label": label})
     return rows
 
 
@@ -3038,14 +3036,13 @@ def _ui_draw_dashboard(scr, rows, sel, msg) -> None:
             continue
         selected = i == sel
         left = ("▸ " if selected else "  ") + row["label"]
-        right = f"[{row['hot']}]"
-        text = " " + pad(left, max(1, w - 8 - _ui_width(right))) + right + " "
+        text = " " + pad(left, max(1, w - 4)) + " "
         _ui_add(scr, y, 2, text, curses.A_REVERSE if selected else 0)
         y += 1
 
     _ui_add(scr, h - 2, 2, msg or "就绪", _ui_color(4))
     _ui_add(scr, h - 1, 2,
-            " ↑/↓ 选择   Enter 执行   q 退出   快捷键见右侧方括号 ",
+            " ↑/↓ 选择   Enter 执行   q 退出 ",
             curses.A_DIM)
 
 
@@ -3325,6 +3322,34 @@ def _ui_vm_edit(scr, vmid) -> None:
         _ui_bust()
 
 
+def _ui_vm_add(scr, cfg: dict) -> str:
+    guests = guest_map()
+    cand = [v for v in sorted(guests, key=lambda x: int(x) if x.isdigit() else 0)
+            if v not in cfg["vms"]]
+    if not cand:
+        return "节点上的虚拟机都已加入备份列表"
+    opts = [f"{v}  {guests[v]['name']}" for v in cand] + ["取消"]
+    ci = _ui_choice(scr, "选择要添加的虚拟机", opts)
+    if ci is None or ci == len(opts) - 1:
+        return ""
+    vmid = cand[ci]
+    out = _ui_capture(add_vm, cfg, vmid, {})
+    _ui_bust()
+    if "已添加" in out:
+        _ui_vm_edit(scr, vmid)
+        return ""
+    return out.strip().split("\n")[-1] if out.strip() else "添加失败"
+
+
+def _ui_vm_toggle(cfg: dict, vmid: str) -> str:
+    vm = cfg["vms"][vmid]
+    vm["enabled"] = "0" if str(vm.get("enabled", "1")) != "0" else "1"
+    save_conf(cfg)
+    _ui_capture(sync_service, cfg)
+    _ui_bust()
+    return f"VM {vmid} 已{'启用' if vm['enabled'] == '1' else '停用'}"
+
+
 def _ui_vm_view(scr) -> None:
     sel = 0
     msg = ""
@@ -3332,7 +3357,8 @@ def _ui_vm_view(scr) -> None:
         cfg = load_conf()
         guests = guest_map()
         vms = sorted(cfg["vms"], key=lambda x: int(x) if x.isdigit() else 0)
-        sel = max(0, min(sel, len(vms) - 1)) if vms else 0
+        # sel == len(vms) 表示底部「＋ 添加虚拟机」
+        sel = max(0, min(sel, len(vms)))
         scr.erase()
         h, w = scr.getmaxyx()
         _ui_box(scr, 0, 0, h, w, "虚拟机备份管理")
@@ -3342,7 +3368,7 @@ def _ui_vm_view(scr) -> None:
         _ui_add(scr, 2, 2, head, curses.A_BOLD)
         _ui_add(scr, 3, 2, "─" * max(0, w - 4), curses.A_DIM)
         if not vms:
-            _ui_add(scr, 5, 2, "尚未配置虚拟机，按 a 添加")
+            _ui_add(scr, 5, 2, "尚未配置虚拟机，选择下方「＋ 添加虚拟机」")
         for i, vmid in enumerate(vms):
             vm = cfg["vms"][vmid]
             p = target_params(cfg, vmid, guests)
@@ -3354,61 +3380,59 @@ def _ui_vm_view(scr) -> None:
                     f"{pad(p['mode'], 10)} {p['compress']}")
             attr = curses.A_REVERSE if i == sel else 0
             _ui_add(scr, 4 + i, 2, pad(line, w - 5), attr)
+        add_y = 4 + len(vms)
+        add_attr = curses.A_REVERSE if sel == len(vms) else 0
+        _ui_add(scr, add_y, 2, pad(" ＋ 添加虚拟机", w - 5), add_attr)
         _ui_add(scr, h - 2, 2, msg, _ui_color(4))
         _ui_add(scr, h - 1, 2,
-                " a 添加   e/Enter 修改   Space 启用/停用   d 移除   q 返回 ",
+                " ↑/↓ 选择   Enter 操作   q 返回 ",
                 curses.A_DIM)
         scr.refresh()
         ch = _ui_key(scr)
-        msg = ""
+        new_msg = ""
         if isinstance(ch, int):
             if ch == curses.KEY_UP:
                 sel = max(0, sel - 1)
             elif ch == curses.KEY_DOWN:
-                sel = min(max(0, len(vms) - 1), sel + 1)
-            elif ch in (10, 13, curses.KEY_ENTER) and vms:
-                _ui_vm_edit(scr, vms[sel])
+                sel = min(len(vms), sel + 1)
+            elif ch in (10, 13, curses.KEY_ENTER):
+                if sel == len(vms):
+                    new_msg = _ui_vm_add(scr, cfg)
+                else:
+                    vmid = vms[sel]
+                    g = guests.get(vmid, {})
+                    p = target_params(cfg, vmid, guests)
+                    act = _ui_choice(scr, f"VM {vmid} · {p['name'] or '-'}", [
+                        "修改参数",
+                        "启用 / 停用",
+                        "从备份列表移除",
+                        "返回",
+                    ], info=[
+                        f"节点状态 {g.get('status', '-')}",
+                        f"当前 {'启用' if p['enabled'] else '停用'}",
+                    ])
+                    if act == 0:
+                        _ui_vm_edit(scr, vmid)
+                    elif act == 1:
+                        new_msg = _ui_vm_toggle(cfg, vmid)
+                    elif act == 2:
+                        if _ui_confirm(scr, f"从备份列表移除 VM {vmid}？（备份文件不删）"):
+                            _ui_capture(remove_vm, cfg, vmid)
+                            _ui_bust()
+                            new_msg = f"已移除 VM {vmid}"
             elif ch in (27,):
                 return
+            msg = new_msg
             continue
         if ch in ("q", "\x1b"):
             return
-        if ch == "a":
-            guests = guest_map()
-            cand = [v for v in sorted(guests, key=lambda x: int(x) if x.isdigit() else 0)
-                    if v not in cfg["vms"]]
-            if not cand:
-                msg = "节点上的虚拟机都已加入备份列表"
-                continue
-            opts = [f"{v}  {guests[v]['name']}" for v in cand] + ["取消"]
-            ci = _ui_choice(scr, "选择要添加的虚拟机", opts)
-            if ci is None or ci == len(opts) - 1:
-                continue
-            vmid = cand[ci]
-            out = _ui_capture(add_vm, cfg, vmid, {})
-            if "已添加" in out:
-                _ui_vm_edit(scr, vmid)
+        if ch in ("\n", "\r"):
+            if sel == len(vms):
+                msg = _ui_vm_add(scr, cfg)
             else:
-                msg = out.strip().split("\n")[-1] if out.strip() else "添加失败"
-            _ui_bust()
+                _ui_vm_edit(scr, vms[sel])
             continue
-        if not vms:
-            continue
-        vmid = vms[sel]
-        if ch in ("e", "\n", "\r"):
-            _ui_vm_edit(scr, vmid)
-        elif ch == "d":
-            if _ui_confirm(scr, f"从备份列表移除 VM {vmid}？（备份文件不删）"):
-                _ui_capture(remove_vm, cfg, vmid)
-                _ui_bust()
-                msg = f"已移除 VM {vmid}"
-        elif ch == " ":
-            vm = cfg["vms"][vmid]
-            vm["enabled"] = "0" if str(vm.get("enabled", "1")) != "0" else "1"
-            save_conf(cfg)
-            _ui_capture(sync_service, cfg)
-            _ui_bust()
-            msg = f"VM {vmid} 已{'启用' if vm['enabled'] == '1' else '停用'}"
+        msg = new_msg
 
 
 def _ui_remotes_view(scr) -> None:
@@ -3671,20 +3695,12 @@ def _ui_dashboard() -> None:
                 continue
             if ch in ("q", "\x1b"):
                 return
-            if ch in ("j", "k"):
-                sel = _ui_move(rows, sel, 1 if ch == "j" else -1)
-                continue
             if ch in ("\n", "\r"):
                 key = rows[sel]["key"]
                 msg, quit_now = _ui_action(scr, key, _ui_info())
                 if quit_now:
                     return
                 continue
-            hot = {r["hot"]: r["key"] for r in rows if r["kind"] == "item"}
-            if ch in hot:
-                msg, quit_now = _ui_action(scr, hot[ch], _ui_info())
-                if quit_now:
-                    return
 
     try:
         curses.wrapper(_loop)
