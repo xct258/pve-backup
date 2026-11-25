@@ -1,8 +1,27 @@
 # pve-backup
 
-Proxmox VE 多虚拟机备份 + WebDAV 远传工具（单文件 Python，无需额外依赖库）。
+Proxmox VE 多虚拟机备份 + WebDAV 远传工具，整个程序就是一个 Python 脚本，只使用标准库。
 
-它绕过 `vzdump` 钩子，用常驻调度进程自己编排整个流程：**vzdump 备份 → 逐个上传远端 WebDAV → 本地/远端保留策略 → 汇总报告**。
+它不用 `vzdump` 钩子，而是由常驻调度进程自己编排：
+
+**vzdump 备份 → 逐个上传远端 WebDAV → 本地/远端保留策略 → 汇总报告**
+
+仓库只保留两个文件：主程序 `pve-backup` 和本说明。
+
+## 目录
+
+- [特性](#特性)
+- [环境要求](#环境要求)
+- [快速开始](#快速开始)
+- [命令](#命令)
+- [配置](#配置)
+- [调度时间格式](#调度时间格式)
+- [目录与文件](#目录与文件)
+- [交互界面](#交互界面)
+- [自动快照](#自动快照)
+- [推送通知](#推送通知)
+- [日志与排错](#日志与排错)
+- [常见问题](#常见问题)
 
 ## 特性
 
@@ -28,7 +47,11 @@ Proxmox VE 多虚拟机备份 + WebDAV 远传工具（单文件 Python，无需�
 
 ## 快速开始
 
+以下命令都以 root 执行：
+
 ```bash
+apt update && apt install -y rclone
+
 git clone https://github.com/xct258/pve-backup.git
 cd pve-backup
 chmod +x pve-backup
@@ -52,7 +75,19 @@ chmod +x pve-backup
 ./pve-backup run
 ```
 
-首次**无参数**运行且尚未安装到 `/usr/local/sbin/pve-backup` 时，会提示是否现在安装（输入 `y` 走上面的 install 流程）。不想被询问可以设置 `PVE_BACKUP_NO_PROMPT=1`。
+如果暂时不配置 WebDAV，可以先只装服务：
+
+```bash
+./pve-backup install \
+  --mode snapshot \
+  --compress zstd \
+  --prune keep-last=3 \
+  --keep 6
+```
+
+之后运行 `pve-backup`，在「全局参数 → WebDAV 连接」里补上地址和账号。
+
+首次**无参数**运行且尚未安装到 `/usr/local/sbin/pve-backup` 时，会提示是否现在安装。不想被询问可以设置 `PVE_BACKUP_NO_PROMPT=1`。
 
 WebDAV 默认地址为 `http://192.168.50.4:5244/dav`，也可以在仪表盘「全局参数 → WebDAV 连接」里配置：远端名称、地址、用户名、密码，保存后自动测试连接；修改名称会新建一个 rclone remote，旧的不会删除。
 
@@ -85,7 +120,7 @@ WebDAV 默认地址为 `http://192.168.50.4:5244/dav`，也可以在仪表盘「
 
 ## 配置
 
-配置文件 `/etc/pve-backup.conf`（INI 格式，示例见 [examples/pve-backup.conf.example](examples/pve-backup.conf.example)）：
+配置文件是 `/etc/pve-backup.conf`（INI 格式），`install` 会自动生成一份可用配置；下面是完整示例：
 
 ```ini
 [global]
@@ -147,7 +182,7 @@ delete_local = 1
 - 同一个时间文件夹里有多台 VM 时，只有所有 VM 都超过各自保留数才会被删除，含无法识别文件的文件夹一律保留
 - 远端实际路径 = `<remote>:<路径>/<host_name>/<运行时间戳>/`
 - `[vm:ID]` 段中留空的字段继承 `[global]`。
-- 旧的 shell 版配置（`STORAGE=...` 形式）会被自动迁移。
+- 旧版 `KEY=value` 配置（如 `STORAGE=...`）会在启动时自动迁移为 INI。
 
 ## 调度时间格式
 
@@ -271,6 +306,18 @@ pve-backup snapshot 100      # 只处理 100
 pve-backup notify "测试消息"
 ```
 
+## 日志与排错
+
+```bash
+pve-backup status                          # 调度、远端、VM 与最近日志
+journalctl -u pve-backup -n 100 --no-pager # systemd 服务日志
+tail -f /var/log/pve-backup.log            # 运行日志
+```
+
+- 调度服务是**常驻进程**，不是 systemd timer；修改配置后执行 `pve-backup install` 或 `pve-backup reset` 会重启服务
+- `/run/pve-backup.lock` 防止多个备份任务同时运行
+- 退出码：`0` 全部成功；`1` 备份或上传存在失败；`2` 参数错误
+
 ## 常见问题
 
 **报错「未找到 rclone」**
@@ -284,14 +331,3 @@ pve-backup notify "测试消息"
 
 **备份失败后怎么补？**
 `pve-backup upload` 会扫描本地归档补齐远端；`run <vmid>` 可单独重跑某台。
-
-**退出码**
-`0` 全部成功；`1` 存在备份或上传失败；`2` 参数错误。systemd 服务据此判断失败。
-
-## legacy
-
-`legacy/` 里是早期的 shell 实现（`pve-backup.sh` + WebDAV 上传脚本 + hook 方案），已被单文件版取代，仅作历史参考，不要在生产上再使用。
-
-## License
-
-MIT
